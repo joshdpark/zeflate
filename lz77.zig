@@ -49,7 +49,7 @@ const Pointer = struct {
 /// matches for a sequence of 3 bytes in a search buffer
 const Window = struct {
     buf: []const u8,
-    seq: [3]u8,
+    seq: *const [3]u8,
 
     const Iterator = struct {
         window: *const Window,
@@ -59,9 +59,10 @@ const Window = struct {
         fn next(self: *@This()) ?usize {
             const buf = self.window.buf;
             const seq = self.window.seq[0..];
-            while (self.pos < buf.len - 3) : (self.pos += 1) {
-                std.debug.print("{s}\n", .{buf[self.pos..][0..3]});
+            // std.debug.print("state: buf: {s}, seq: {s}\n", .{ buf, seq });
+            while (self.pos <= buf.len - 3) : (self.pos += 1) {
                 // compare the sequence of 3 bytes against the search buffer
+                // std.debug.print("pos: {d}, limit: {d}, buf: {s}, seq: {s}\n", .{ self.pos, buf.len - 3, buf[self.pos..][0..3], seq });
                 if (std.mem.eql(u8, buf[self.pos..][0..3], seq)) {
                     const tmp = self.pos;
                     self.pos += 1;
@@ -82,15 +83,17 @@ const Window = struct {
 
 test Window {
     const w = Window{
-        .search_buffer = "aabbccddbbceeff",
-        .sequence = [_]u8{ 'b', 'b', 'c' },
+        .buf = "aabbccddbbceeff",
+        .seq = "bbc",
     };
     var it = w.iter();
-    while (it.next()) |n| {
-        std.debug.print("pos: {d}\n", .{n});
-    } else {
-        std.debug.print("pos: null\n", .{});
-    }
+    try expect(it.next().? == 2);
+    try expect(it.next().? == 8);
+    // while (it.next()) |n| {
+    //     std.debug.print("pos: {d}\n", .{n});
+    // } else {
+    //     std.debug.print("pos: null\n", .{});
+    // }
 }
 
 /// NOTE: this is an linear search, since for each char in the search buffer,
@@ -98,48 +101,61 @@ test Window {
 fn match(buf: []const u8, cursor: usize) ?Pointer {
     const search: []const u8 = buf[0..cursor];
     const lookahead: []const u8 = buf[cursor..];
-    const here = buf[cursor];
+    const window = Window{
+        .buf = search,
+        .seq = lookahead[0..3],
+    };
+    // std.debug.print("window: {s}, {s}\n", .{ window.buf, window.seq });
+    // here is where we will store the offset and length of a matching sequence
+    // with the following priorities:
+    // 1. the longest length is used
+    // 2. the offset closet to the cursor (min(cursor - offset))
+    var offset: ?usize = null;
+    var len: ?u12 = null;
+    var it = window.iter();
+    while (it.next()) |match_offset| {
+        const matchbuf = buf[match_offset..];
+        // std.debug.print("matchbuf: {s}\n", .{matchbuf});
+        var l: u12 = 0;
+        while (l < lookahead.len and lookahead[l] == matchbuf[l]) {
+            l += 1;
+        }
+        //compare lengths
+        if (l < len orelse 0) {
+            continue;
+        }
+        len = l;
+        offset = cursor - match_offset;
+        // std.debug.print("offset: {d}, len: {d}\n", .{ offset orelse 0, len orelse 0 });
+    }
     // TODO: I'm pretty sure I could use simd vectorization here to do an xor
     // comparison if there is a match, therefore removing branching.
-    const matched: usize = blk: for (search, 0..) |behind, i| {
-        if (behind == here) {
-            break :blk i;
-        }
+    if (offset) |_| {
+        return Pointer{ .offset = offset.?, .len = len.? };
     } else {
         return null;
-    };
-    const offset: usize = search[matched..].len;
-    const len: u12 = blk: {
-        const matchbuf = buf[matched..];
-        var j: u12 = 0;
-        while (j < lookahead.len and lookahead[j] == matchbuf[j]) {
-            j += 1;
-        }
-        break :blk j; // go from index to len
-    };
-    return Pointer{ .offset = offset, .len = len };
+    }
 }
 
 test match {
-    // std.debug.print("{any}\n", .{match("aabbccbb", 6).?});
-    try expect(std.meta.eql(match("aabbccbb", 6).?, Pointer{ .offset = 4, .len = 2 }));
+    try expect(std.meta.eql(match("aabbbcbbb", 6).?, Pointer{ .offset = 4, .len = 3 }));
     try expect(match("aabbccdd", 4) == null);
     // match should also extend past the search buffer into the lookahead
     try expect(std.meta.eql(match("aabbaabbaabb", 4).?, Pointer{ .offset = 4, .len = 8 }));
+    // match should get the offset closest to the cursor
+    std.debug.print("{any}\n", .{match("aaabbbaaaaaaccc", 9).?});
+    try expect(std.meta.eql(match("aaabbbaaaaaaccc", 9).?, Pointer{ .offset = 3, .len = 3 }));
 }
 
-// TODO: right now it matches on any length, which is inefficient because we
-// really should only have a pointer if the match length > 2.
-// TODO: this implementation always starts from the beginning of the search
-// buffer and scans through from beginning to end. We want to make sure that we
-// use the closest match first before going back through the search buffer.
 // TODO: we are also not searching for the longest match, just the first match.
 fn naive_lz77(input: []const u8, list: anytype) !void {
-    var cursor: usize = 0;
-    var matchlen: u12 = 0;
+    // no need to start cursor at the beginning since we're matching on a sliding window of 3 bytes
+    var cursor: usize = 3;
+    _ = try list.writeAll(input[0..cursor]);
+    // var matchlen: u12 = 0;
     while (cursor < input.len) {
         if (match(input, cursor)) |ptr| {
-            matchlen += 1;
+            // matchlen += 1;
             _ = try list.writeByte('<');
             try formatInt(ptr.offset, 10, .lower, .{}, list);
             _ = try list.writeByte(',');
