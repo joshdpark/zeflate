@@ -3,9 +3,61 @@
 /// huffman tree and then representing the tree in smaller and smaller ways that
 /// can speed up the compression/decompression
 const std = @import("std");
+const assert = std.debug.assert;
+const bitReader = @import("bitreader.zig").variant3;
 const PriorityQueue = std.PriorityQueue;
 const Allocator = std.mem.Allocator;
 const Order = std.math.Order;
+
+fn filo(comptime T: type) type {
+    return struct {
+        data: []T,
+        available: u16,
+        start: u16,
+        end: u16,
+
+        fn init(buf: []T) @This() {
+            return .{ .data = buf, .available = @intCast(buf.len), .start = 0, .end = 0 };
+        }
+
+        fn empty(self: *@This()) bool {
+            return self.data.len == self.available;
+        }
+
+        fn insert(self: *@This(), item: T) void {
+            assert(self.available > 0);
+            self.data[self.end] = item;
+            if (self.end + 1 == self.data.len) {
+                self.end = 0;
+            } else {
+                self.end += 1;
+            }
+            self.available -= 1;
+        }
+
+        fn remove(self: *@This()) T {
+            assert(self.available < self.data.len);
+            const item = self.data[self.start];
+            if (self.start + 1 == self.data.len) {
+                self.start = 0;
+            } else {
+                self.start += 1;
+            }
+            self.available += 1;
+            return item;
+        }
+    };
+}
+
+test filo {
+    var buf: [10]i32 = undefined;
+    const itemq = filo(i32);
+    var q = itemq.init(buf[0..]);
+    q.insert(10);
+    q.insert(-32);
+    try std.testing.expect(10 == q.remove());
+    std.debug.print("\n{any}\n", .{q.remove()});
+}
 
 const huffnode = struct {
     code: u8,
@@ -14,35 +66,41 @@ const huffnode = struct {
     branch: ?[2]*huffnode,
 };
 
+const HuffEntry = struct {
+    sym: u8,
+    bitlen: u8,
+};
+
 /// keeping track of both the bitlen (the depth of the tree) as well as the
-/// doing a postorder traversal of the tree. Should write results to an
-/// associated list of bitlens and their codes.
-/// TODO: add in the associated list
-fn postorder(root: *huffnode) void {
-    var stack: [100]*huffnode = undefined;
-    var bitlens = [_]u8{0} ** 100;
-    var items: usize = 0;
-    stack[items] = root;
-    items += 1;
-    while (true) {
-        if (items == 0)
-            break;
-        // pop the stack
-        const node = stack[items - 1];
-        const bitlen = &bitlens[items - 1];
-        items -= 1;
-        if (node.branch) |branch| {
-            bitlen.* += 1;
-            // add branches to stack
+/// doing a traversal of the tree. Should write results to an associated list of
+/// bitlens and their codes.
+fn traverse(root: *huffnode, bit_counts: []u8, codelist: []HuffEntry) u8 {
+    const data = struct {
+        node: *huffnode,
+        bitlen: u8,
+    };
+    const dataq = filo(data);
+
+    var max_bitlen: u8 = 0;
+    var buf: [100]data = undefined;
+    var queue = dataq.init(buf[0..100]);
+    var i: usize = 0;
+    queue.insert(data{ .node = root, .bitlen = 0 });
+    while (!queue.empty()) {
+        const d = queue.remove();
+        if (d.node.branch) |branch| {
             for (branch) |b| {
-                stack[items] = b;
-                bitlens[items] = bitlen.*;
-                items += 1;
+                queue.insert(data{ .node = b, .bitlen = d.bitlen + 1 });
             }
         } else {
-            std.debug.print("bitlen: {d}, code: {c}\n", .{ bitlen.*, node.code });
+            // std.debug.print("sym: {c}, bitlen: {d}, \n", .{ d.node.code, d.bitlen });
+            codelist[i] = .{ .sym = d.node.code, .bitlen = d.bitlen };
+            bit_counts[d.bitlen] += 1;
+            max_bitlen = @max(max_bitlen, d.bitlen);
+            i += 1;
         }
     }
+    return max_bitlen;
 }
 
 fn lessThan(context: void, a: *huffnode, b: *huffnode) Order {
@@ -64,6 +122,8 @@ fn build_tree(buf: []u8, allocator: Allocator) !*huffnode {
     var pq = pq_t.init(allocator, {});
     defer pq.deinit();
     var i: u16 = 0; // this feels awful, I want to use u8, but get overflow otherwise
+
+    // add all symbols as nodes
     while (i < buf.len) : (i += 1) {
         if (buf[i] == 0)
             continue;
@@ -91,19 +151,64 @@ fn build_tree(buf: []u8, allocator: Allocator) !*huffnode {
     return root;
 }
 
-fn decode(reader: anytype, root: *huffnode) void {
-    var bit_stream = std.io.bitReader(.little, reader);
-    var node = root;
-    while (true) {
-        if (node.branch) |branch| {
-            const bit = bit_stream.readBitsNoEof(u1, 1) catch
-                return;
-            std.debug.print("{b}", .{bit});
-            node = branch[bit];
-        } else {
-            std.debug.print(" code: {c}\n", .{node.code});
-            node = root; // go back to the root node
+/// TODO: instead of descending down the tree, you need to instead use a table
+/// of huffman values that use the max_bitlen; Since these are prefix codes, you
+/// can store all leaves in the tree as entries in a table that are indexed by
+/// their bitcode
+fn decode(reader: anytype, huff_table: []HuffEntry) !void {
+    var bit_reader = bitReader(reader);
+    try bit_reader.refill();
+    std.debug.print("bitbuf: {b:0>64}\n", .{bit_reader.bitbuf});
+    inline for (0..3) |_| {
+        const bits = bit_reader.peek(4);
+        // std.debug.print("bits: {b:0>4}\n", .{bits});
+        const entry = huff_table[bits];
+        std.debug.print("bits: {b}, sym: {c}\n", .{ bits, entry.sym });
+        bit_reader.consume(entry.bitlen);
+    }
+}
+
+/// generate a canonical prefix encoding
+fn canonical(root: *huffnode, huff_table: []HuffEntry) void {
+    var bl_counts = [_]u8{0} ** 16;
+    var tree = [_]HuffEntry{.{ .sym = 0, .bitlen = 0 }} ** 16;
+    // zero out canon table
+    for (huff_table) |*c| {
+        c.* = HuffEntry{ .sym = 0, .bitlen = 0 };
+    }
+    const max = traverse(root, bl_counts[0..], tree[0..]);
+    // std.debug.print("bl_count: {any}\n", .{ bl_counts, tree });
+    var next_code = [_]u16{0} ** 15;
+    std.debug.print("bl_counts: {d}, max: {d}\n", .{ bl_counts, max });
+    {
+        var code: u16 = 0;
+        bl_counts[0] = 0;
+        var bits: u16 = 1;
+        while (bits <= max) : (bits += 1) {
+            code = (code + bl_counts[bits - 1]) << 1;
+            std.debug.print("N: {d}, code[N]: {b}\n", .{ bits, code });
+            next_code[bits] = code;
         }
+    }
+    for (tree) |t| {
+        const len = t.bitlen;
+        if (len != 0) {
+            huff_table[next_code[len] << @as(u4, @truncate(max - len))] = t;
+            next_code[len] += 1;
+        }
+    }
+    {
+        var i: usize = 1;
+        while (i < huff_table.len) : (i += 1) {
+            const prev: HuffEntry = huff_table[i - 1];
+            if (huff_table[i].bitlen == 0)
+                huff_table[i] = prev;
+        }
+    }
+    for (0.., huff_table) |i, t| {
+        // if (t.bitlen == 0)
+        //     continue;
+        std.debug.print("code: {b}, symbol: {c}, bitlen: {d}\n", .{ i, t.sym, t.bitlen });
     }
 }
 
@@ -117,14 +222,18 @@ pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const str = "aaaabbbccccccdddddddeeeeeeeeeee";
+    const str = "aaaabbbbccccddddeeeeeffffffgghh";
 
     freq_table(str, buf[0..]);
     // std.debug.print("freq_table: {s}\n", .{buf[0..]});
     const root = try build_tree(buf[0..], allocator);
-    postorder(root);
-    const ex = [_]u8{0b0011110};
+    var huff_table = [_]HuffEntry{.{ .sym = 0, .bitlen = 0 }} ** 16;
+    canonical(root, huff_table[0..]);
+    // var bl_count = [_]u8{0} ** 15;
+    // traverse(root, bl_count[0..]);
+    // std.debug.print("{any}\n", .{bl_count});
+    const ex = [_]u8{ 0b10100011, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x5a };
     var in_mem = std.io.fixedBufferStream(ex[0..]);
     std.debug.print("{b:0>8}\n", .{ex});
-    decode(in_mem.reader(), root);
+    try decode(in_mem, huff_table[0..]);
 }
