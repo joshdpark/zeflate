@@ -1,17 +1,15 @@
-/// This is to work through a decompressor example from an example text that
-/// will be compressed.
-
 // GOAL: read a gzip file (disregard the gzip headers) and output the header for
 // the first deflate block
 const std = @import("std");
+const io = std.io;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 const stdout = std.io.getStdOut().writer();
-const MAXLENCODES = 286; // (257 - 286)
+const MAXLITCODES = 286; // (257 - 286)
 const MAXDISTCODES = 30; // (1-32)
-const MAXCODES = MAXLENCODES + MAXDISTCODES;
+const MAXCODES = MAXLITCODES + MAXDISTCODES;
 const MAXCODELEN = 16; // maximum number of bits in a huffman code;
 
 fn BitReader(comptime ReaderType: type) type {
@@ -46,6 +44,8 @@ fn BitReader(comptime ReaderType: type) type {
         }
 
         fn getbits(self: *Self, n: u6) u64 {
+            if (n == 0)
+                return 0;
             if (self.bitcount < n)
                 self.refill();
             const value: u64 = self.peek_lsb(n);
@@ -97,15 +97,14 @@ const HuffTable = struct {
     symbol: []u16, // up to 286 literal/length codes
 };
 
-// NOTES:
-// A 'symbol' is the byte that is being encoded in a huffman code
-// A 'code' is a variable number of bits that decodes to a symbol
-// A 'code length' aka 'hclen' (huffman code length) is the number of bits that makes up the code
-// The deflate format specifies that the run-length encoded symbols 0-18 are encoded by
-// the number of code lengths
-
-// from an array of ranges, build a huffman tree
-fn buildHuffTable(h: *HuffTable, code_lengths: []const u16, comptime hclen: u8) void {
+/// NOTES:
+/// A 'symbol' is the byte that is being encoded in a huffman code
+/// A 'code' is a variable number of bits that decodes to a symbol
+/// A 'code length' aka 'hclen' (huffman code length) is the number of bits that makes up the code
+/// The deflate format specifies that the run-length encoded symbols 0-18 are encoded by
+/// the number of code lengths
+/// from an array of ranges, build a huffman tree
+fn buildHuffTable(h: *HuffTable, code_lengths: []const u16, comptime hclen: u9) void {
     std.debug.print(
         \\code_lengths
         \\This is the most important table. This is the table in which all of
@@ -203,6 +202,7 @@ fn decode(br: anytype, h: *HuffTable) !u16 {
     var first: u16 = 0;
     var freq: u16 = undefined;
     var index: u16 = 0;
+    // TODO; use a limit table (previously calculated as next_code)
     while (len <= MAXCODELEN) : (len += 1) {
         code |= @truncate(br.getbits(1));
         freq = h.freq[len];
@@ -215,18 +215,20 @@ fn decode(br: anytype, h: *HuffTable) !u16 {
     return error.OutOfCodes;
 }
 
-fn decodeDynamicLength(br: anytype, bh: *BlockHeader, len_tbl: *HuffTable) !void {
+fn decodeDynamic(br: anytype, bh: *BlockHeader, len_tbl: *HuffTable, literals: *HuffTable, distances: *HuffTable) !void {
     const rle_length: u9 = @as(u9, bh.hlit) + 258 + @as(u9, bh.hdist);
-    var hlitlen: [MAXCODES]u16 = undefined;
+    var codelen_table: [MAXCODES]u16 = undefined;
     var prev: u16 = undefined;
     var i: usize = 0;
+    var minlen: u8 = 15;
     while (i < rle_length) {
         const code = try decode(br, len_tbl);
         switch (code) {
             0...15 => {
-                hlitlen[i] = code;
+                codelen_table[i] = code;
                 // std.debug.print("{d}, ", .{code});
                 prev = code;
+                minlen = if (code == 0) minlen else @min(code, minlen);
                 i += 1;
             },
             // NOTE: fun thing, the huffman codes are read in MSB but when
@@ -235,7 +237,7 @@ fn decodeDynamicLength(br: anytype, bh: *BlockHeader, len_tbl: *HuffTable) !void
                 const repeat = br.getbits(2) + 3;
                 for (0..repeat) |_| {
                     // std.debug.print("{d}, ", .{prev});
-                    hlitlen[i] = prev;
+                    codelen_table[i] = prev;
                     i += 1;
                 }
             },
@@ -243,7 +245,7 @@ fn decodeDynamicLength(br: anytype, bh: *BlockHeader, len_tbl: *HuffTable) !void
                 const repeat = br.getbits(3) + 3;
                 // std.debug.print("code: 17, repeat 0 {d} times\n", .{repeat});
                 for (0..repeat) |_| {
-                    hlitlen[i] = 0;
+                    codelen_table[i] = 0;
                     i += 1;
                 }
             },
@@ -251,14 +253,65 @@ fn decodeDynamicLength(br: anytype, bh: *BlockHeader, len_tbl: *HuffTable) !void
                 const repeat = br.getbits(7) + 11;
                 // std.debug.print("code 18, repeat 0 {d} times\n", .{repeat});
                 for (0..repeat) |_| {
-                    hlitlen[i] = 0;
+                    codelen_table[i] = 0;
                     i += 1;
                 }
             },
             else => {},
         }
     }
-    std.debug.print("{d}\n", .{hlitlen});
+    const litcount: u16 = 257 + @as(u16, bh.hlit);
+    const distcount: u16 = bh.hdist + 1;
+    const lit_table = codelen_table[0..litcount];
+    const dist_table = codelen_table[litcount..][0..distcount];
+    std.debug.print("literal codes: {d}\n", .{lit_table});
+    std.debug.print("distance codes: {d}\n", .{dist_table});
+    std.debug.print("minlen: {d}\n", .{minlen});
+
+    // build a freq/symbol table for literals
+    buildHuffTable(literals, lit_table[0..], MAXLITCODES);
+    // build a freq/symbol table for distances
+    buildHuffTable(distances, dist_table[0..], MAXDISTCODES);
+}
+
+fn inflate(reader: anytype, literals: *HuffTable, distances: *HuffTable) !void {
+    // base lengths/distances and how many extra bits to consume and how
+    const lenconsume = [_]u3{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+    const lenbase = [_]u16{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+    const distconsume = [_]u4{ 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+    const distbase = [_]u16{ 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+
+    var buffer: [1 << 15]u8 = undefined;
+    var fbs = io.fixedBufferStream(buffer[0..]);
+    var writer = fbs.writer();
+    // const seeker = fbs.seeker();
+
+    var sym: u16 = undefined;
+    while (true) {
+        // for (0..30) |_| {
+        sym = try decode(reader, literals);
+        if (sym < 256) {
+            try writer.writeByte(@as(u8, @truncate(sym)));
+            std.debug.print("{c}", .{@as(u8, @truncate(sym))});
+        } else if (sym == 256) {
+            break;
+        } else {
+            const lenid = sym - 257;
+            const len_extra = @as(u9, @truncate(reader.getbits(lenconsume[lenid])));
+            const len = lenbase[lenid] + len_extra;
+
+            const distcode = try decode(reader, distances);
+            const dist_extra = @as(usize, @truncate(reader.getbits(distconsume[distcode])));
+            const distance = distbase[distcode] + dist_extra;
+
+            // seeker.seekBy(distance);
+            for (0..len) |_| {
+                try writer.writeByte(fbs.buffer[fbs.pos - distance]);
+            }
+            std.debug.print("<{d}, {d}>\n", .{ len, distance });
+        }
+    }
+    try stdout.print("{s}", .{fbs.buffer});
 }
 
 // TODO: this isn't very elegant but it works
@@ -281,16 +334,16 @@ pub fn main() !void {
     defer fd.close();
     var buf_reader = std.io.bufferedReader(fd.reader());
     const stream = buf_reader.reader();
-    try stdout.print("gzip header bytes: \n", .{});
+    // try stdout.print("gzip header bytes: \n", .{});
     for (0..10) |_| {
-        try stdout.print("{x} ", .{try stream.readByte()});
+        std.debug.print("{x} ", .{try stream.readByte()});
     }
     {
-        try stdout.print("\nfilename: ", .{});
+        std.debug.print("\nfilename: ", .{});
         while (stream.readByte()) |byte| {
             if (byte == 0)
                 break;
-            try stdout.print("{c}", .{byte});
+            std.debug.print("{c}", .{byte});
         } else |_| {}
     }
     // set up bitreader
@@ -312,5 +365,21 @@ pub fn main() !void {
         .symbol = lensym[0..],
     };
     buildHuffTable(&len_tbl, hclen[0..], hclen.len);
-    try decodeDynamicLength(&br, &block_header, &len_tbl);
+
+    // decode codelength codes to literal/length code tables
+    var litfreq = [_]u16{0} ** MAXCODELEN;
+    var litsym = [_]u16{0} ** MAXLITCODES;
+    var lit: HuffTable = .{
+        .freq = litfreq[0..],
+        .symbol = litsym[0..],
+    };
+    // build a freq/symbol table for distances
+    var distfreq = [_]u16{0} ** MAXCODELEN;
+    var distsym = [_]u16{0} ** MAXDISTCODES;
+    var dist: HuffTable = .{
+        .freq = distfreq[0..],
+        .symbol = distsym[0..],
+    };
+    try decodeDynamic(&br, &block_header, &len_tbl, &lit, &dist);
+    try inflate(&br, &lit, &dist);
 }
