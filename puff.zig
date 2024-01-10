@@ -37,6 +37,17 @@ fn BitReader(comptime ReaderType: type) type {
             return self.buf & mask;
         }
 
+        // get n lowest bits in the bitbuf in msb order.
+        inline fn peek_msb(self: *Self, n: u6) u64 {
+            var code = 0;
+            for (0..n) |_| {
+                code <<= 1;
+                code |= self.buf & 1;
+                self.buf >>= 1;
+            }
+            return code;
+        }
+
         inline fn consume(self: *Self, n: u6) void {
             assert(n <= self.bitcount);
             self.buf >>= n;
@@ -96,6 +107,52 @@ const HuffTable = struct {
     freq: []u16, // frequency table of code lengths
     symbol: []u16, // up to 286 literal/length codes
 };
+
+// There are a number of different tables for doing decoding of canonical prefix codes
+// 1. a weight/frequency table for each symbol -> symbol : weight
+// 2. a code length table -> symbol : number of bits for code word
+// 3. a code word table -> symbol : bits
+// 4. a base table -> code length : starting number of first codeword
+// 5. a offset table -> code length : offset into the code word table
+// A decode table based on Moffat/Turpin
+fn DecodeTable(ReaderType: type) type {
+    return struct {
+        bit_reader: ReaderType,
+        base: []u16, // the base table can be left justified;
+        offset: []u16,
+        symbol: []u16,
+
+        fn canonical_decode(self: *@This()) u16 {
+            var code = self.bit_reader.getbits(1);
+            var length = 1;
+            while (code < self.base[length]) : (length += 1) {
+                code <<= 1;
+                code |= self.bit_reader.getbits(1);
+            }
+            return self.symbol[self.offset[length] + (code - self.base[length])];
+        }
+
+        fn fast_decode_one_shift(self: @This()) u16 {
+            // V is a w-bit window (w >= length of longest codeword) into the bitstream
+            const w = 8; // setting w manually;
+            var v = self.bit_reader.peek_msb(w);
+            var length = 1;
+            while (self.base[length] > v)
+                length += 1;
+            const id = self.offset[length] + ((v - self.base[length]) << w - length);
+            // TODO begin: does v need to be in the struct?
+            v <<= length;
+            self.bit_reader.consume(w);
+            v |= self.bit_reader.peek_msb(length);
+            // TODO end;
+            return self.symbol[id];
+        }
+    };
+}
+
+fn decodeTable(reader: type) DecodeTable(@TypeOf(reader)) {
+    return .{ .bit_reader = bitReader(reader) };
+}
 
 /// NOTES:
 /// A 'symbol' is the byte that is being encoded in a huffman code
@@ -296,12 +353,12 @@ fn inflate(reader: anytype, literals: *HuffTable, distances: *HuffTable) !void {
         } else if (sym == 256) {
             break;
         } else {
-            const lenid = sym - 257;
-            const len_extra = @as(u9, @truncate(reader.getbits(lenconsume[lenid])));
+            const lenid: usize = sym - 257;
+            const len_extra: u9 = @truncate(reader.getbits(lenconsume[lenid]));
             const len = lenbase[lenid] + len_extra;
 
             const distcode = try decode(reader, distances);
-            const dist_extra = @as(usize, @truncate(reader.getbits(distconsume[distcode])));
+            const dist_extra: usize = reader.getbits(distconsume[distcode]);
             const distance = distbase[distcode] + dist_extra;
 
             // seeker.seekBy(distance);
