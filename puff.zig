@@ -280,6 +280,7 @@ fn decodeDynamic(br: anytype, bh: *BlockHeader, len_tbl: *HuffTable, literals: *
     var minlen: u8 = 15;
     while (i < rle_length) {
         const code = try decode(br, len_tbl);
+        std.debug.print("decoded length: {d}\n", .{code});
         switch (code) {
             0...15 => {
                 codelen_table[i] = code;
@@ -349,7 +350,7 @@ fn inflate(reader: anytype, literals: *HuffTable, distances: *HuffTable) !void {
         sym = try decode(reader, literals);
         if (sym < 256) {
             try writer.writeByte(@as(u8, @truncate(sym)));
-            std.debug.print("{c}", .{@as(u8, @truncate(sym))});
+            // std.debug.print("{c}", .{@as(u8, @truncate(sym))});
         } else if (sym == 256) {
             break;
         } else {
@@ -365,10 +366,10 @@ fn inflate(reader: anytype, literals: *HuffTable, distances: *HuffTable) !void {
             for (0..len) |_| {
                 try writer.writeByte(fbs.buffer[fbs.pos - distance]);
             }
-            std.debug.print("<{d}, {d}>\n", .{ len, distance });
+            // std.debug.print("<{d}, {d}>\n", .{ len, distance });
         }
     }
-    try stdout.print("{s}", .{fbs.buffer});
+    // try stdout.print("{s}", .{fbs.buffer});
 }
 
 // TODO: this isn't very elegant but it works

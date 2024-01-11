@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 
 fn BitReader(comptime ReaderType: type) type {
     return struct {
@@ -8,7 +9,7 @@ fn BitReader(comptime ReaderType: type) type {
 
         const Self = @This();
 
-        inline fn refill(self: *Self) void {
+        pub inline fn refill(self: *Self) void {
             while (self.bitcount < 56) {
                 const byte: u64 = self.reader.readByte() catch {
                     //TODO: handle end of stream error
@@ -20,29 +21,31 @@ fn BitReader(comptime ReaderType: type) type {
         }
 
         // get n lowest bits in the bitbuf in lsb order.
-        inline fn peek_lsb(self: *Self, n: u6) u64 {
+        pub inline fn peek_lsb(self: *Self, n: u6) u64 {
             const mask = (@as(u64, 1) << n) - 1;
             return self.buf & mask;
         }
 
         // get n lowest bits in the bitbuf in msb order.
-        inline fn peek_msb(self: *Self, n: u6) u64 {
-            var code = 0;
+        pub inline fn peek_msb(self: *Self, n: u6) u64 {
+            var code: u64 = 0;
+            var buf = self.buf;
             for (0..n) |_| {
                 code <<= 1;
-                code |= self.buf & 1;
-                self.buf >>= 1;
+                code |= buf & 1;
+                buf >>= 1;
             }
             return code;
         }
 
-        inline fn consume(self: *Self, n: u6) void {
-            assert(n <= self.bitcount);
+        pub inline fn consume(self: *Self, n: u6) void {
+            if (n <= self.bitcount)
+                self.refill();
             self.buf >>= n;
             self.bitcount -= n;
         }
 
-        fn getbits(self: *Self, n: u6) u64 {
+        pub fn getbits(self: *Self, n: u6) u64 {
             if (n == 0)
                 return 0;
             if (self.bitcount < n)
@@ -52,7 +55,7 @@ fn BitReader(comptime ReaderType: type) type {
             return value;
         }
 
-        fn getcode(self: *Self, n: u6) u64 {
+        pub fn getcode(self: *Self, n: u6) u64 {
             if (self.bitcount < n)
                 self.refill();
             var code: u64 = 0;
@@ -67,7 +70,6 @@ fn BitReader(comptime ReaderType: type) type {
     };
 }
 
-fn bitReader(reader: anytype) BitReader(@TypeOf(reader)) {
+pub fn bitReader(reader: anytype) BitReader(@TypeOf(reader)) {
     return .{ .reader = reader };
 }
-
