@@ -19,11 +19,6 @@ const MAXCODELEN = 16; // maximum number of bits in a huffman code;
 // hard coded tables in the rfc
 // rfc 3.2.7 under (HCLEN + 4) in block format
 const CodeLengthLookup = [_]u5{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
-// rfc 3.2.5
-// const lenconsume = [_]u3{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
-// const lenbase = [_]u16{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
-// const distconsume = [_]u4{ 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
-// const distbase = [_]u16{ 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
 
 /// a data structure for packing in a code length and a symbol index
 const Symlen = packed struct {
@@ -75,20 +70,16 @@ const HuffTable = struct {
 
     const Self = @This();
 
-    fn canonical_decode(self: *Self, reader: anytype) !u64 {
-        var length = self.minlen;
-        var code = reader.getcode(length);
-        while (code >= self.base[length] + self.freq[length]) : (length += 1) {
-            code <<= 1;
-            code |= reader.getbits(1);
-        }
-        std.debug.print("code length: {d}, code: {d} ", .{ length, code });
-        const symbol_id = self.offset[length] + (code - self.base[length]);
-        std.debug.print("symbol_id: {d} ", .{symbol_id});
-        std.debug.print("symbol: {d}\n", .{self.data[symbol_id].symbol});
-        // write the symbol to the writer
-        return self.data[symbol_id].symbol;
-    }
+    // fn canonical_decode(self: *Self, reader: anytype) !u64 {
+    //     var length = self.minlen;
+    //     var code = reader.getcode(length);
+    //     while (code >= self.base[length] + self.freq[length]) : (length += 1) {
+    //         code <<= 1;
+    //         code |= reader.getbits(1);
+    //     }
+    //     const symbol_id = self.offset[length] + (code - self.base[length]);
+    //     return self.data[symbol_id].symbol;
+    // }
 
     fn one_shift_decode(self: *Self, reader: anytype) !u64 {
         const width: u6 = @truncate(self.maxlen);
@@ -129,17 +120,7 @@ const HuffTable = struct {
 /// The deflate format specifies that the run-length encoded symbols 0-18 are encoded by
 /// the number of code lengths
 /// from an array of ranges, build a huffman tree
-fn buildHuffTable(h: *HuffTable, comptime prefix_size: u4) void {
-    std.debug.print("codelengths:\n", .{});
-    for (h.data) |d| {
-        std.debug.print("{d} ", .{d.length});
-    }
-
-    // TODO: this isn't currently used yet
-    // for a max code word length of 15, this can be captured in a u4 (16 states);
-    const prefix_start: [1 << prefix_size]u4 = undefined;
-    std.debug.print("\nprefix_start len: {d}\n", .{prefix_start.len});
-
+fn buildHuffTable(h: *HuffTable) void {
     // codelength count table
     var freq = [_]u16{0} ** MAXCODELEN;
     for (h.data) |item| {
@@ -148,7 +129,6 @@ fn buildHuffTable(h: *HuffTable, comptime prefix_size: u4) void {
         h.maxlen = @max(len, h.maxlen);
         h.minlen = if (len != 0) @min(len, h.minlen) else h.minlen;
     }
-    std.debug.print("codelength counts\n{d}\n", .{freq[0..h.maxlen]});
 
     // lj_base table
     {
@@ -162,7 +142,6 @@ fn buildHuffTable(h: *HuffTable, comptime prefix_size: u4) void {
         // add sentinel value for absolute maximum code value
         h.lj_base[h.maxlen + 1] = code << 1;
     }
-    std.debug.print("lj_base table\n{d}\n", .{h.lj_base});
 
     // prefix_start table
     {
@@ -178,7 +157,6 @@ fn buildHuffTable(h: *HuffTable, comptime prefix_size: u4) void {
                 const lj = b << h.maxlen - i; // left justify the code
                 const prefix = lj >> rshift; // keep the prefix
                 h.prefix_start[prefix] = i;
-                // std.debug.print("lj_base[{d}]: {b:0>7}; 3-bit prefix: {b:0}\n", .{ i, b, prefix });
             }
         }
         // second pass to fill in the gaps for prefix values that weren't populated
@@ -188,14 +166,12 @@ fn buildHuffTable(h: *HuffTable, comptime prefix_size: u4) void {
                 h.prefix_start[j] = h.prefix_start[j - 1];
         }
     }
-    std.debug.print("prefix_start:\n{d}\n", .{h.prefix_start});
 
     // offset table
     h.offset[1] = 0;
     for (1..h.maxlen) |len| {
         h.offset[len + 1] = h.offset[len] + freq[len];
     }
-    std.debug.print("offset table\n{d}\n", .{h.offset});
 
     // populate the symbol index section of data
     var offset_copy: [MAXCODELEN]u16 = undefined;
@@ -209,10 +185,6 @@ fn buildHuffTable(h: *HuffTable, comptime prefix_size: u4) void {
                 offset_copy[len] += 1;
             }
         }
-    }
-    std.debug.print("symbols: \n", .{});
-    for (h.data[0..h.data.len]) |symlen| {
-        std.debug.print("{d} ", .{symlen.symbol});
     }
 }
 
@@ -245,28 +217,23 @@ fn buildLitLen(br: anytype, decodeTable: *HuffTable) void {
         }
         i += rep;
     }
-    std.debug.print("\nliteral/length code length table:\n", .{});
-    for (lens) |d| {
-        std.debug.print("{d} ", .{d.length});
-    }
 }
 
-fn inflate(reader: anytype, literals: *HuffTable, distances: *HuffTable) !void {
+fn inflate(reader: anytype, list: *std.ArrayList(u8), pos: *usize, literals: *HuffTable, distances: *HuffTable) !void {
     // base lengths/distances and how many extra bits to consume and how
+    // rfc 3.2.5
     const lenconsume = [_]u3{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
     const lenbase = [_]u16{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
     const distconsume = [_]u4{ 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
     const distbase = [_]u16{ 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
 
-    var buffer: [1 << 15]u8 = undefined;
-    var fbs = io.fixedBufferStream(buffer[0..]);
-    var writer = fbs.writer();
-
     var sym: u16 = undefined;
     while (true) {
+        // for (0..30) |_| {
         sym = try literals.table_lookup_decode(reader);
         if (sym < 256) {
-            try writer.writeByte(@as(u8, @truncate(sym)));
+            try list.append(@as(u8, @truncate(sym)));
+            pos.* += 1;
         } else if (sym == 256) {
             break;
         } else {
@@ -279,11 +246,14 @@ fn inflate(reader: anytype, literals: *HuffTable, distances: *HuffTable) !void {
             const distance = distbase[distcode] + dist_extra;
 
             for (0..len) |_| {
-                try writer.writeByte(fbs.buffer[fbs.pos - distance]);
+                // if (pos < distance) {
+                //     std.debug.print("pos: {d}, dist: {d}\n", .{ pos, distance });
+                // }
+                try list.append(list.items[pos.* - distance]);
+                pos.* += 1;
             }
         }
     }
-    try stdout.print("{s}", .{fbs.buffer});
 }
 pub fn main() !void {
     var sfa = std.heap.stackFallback(1024, std.heap.page_allocator);
@@ -295,6 +265,9 @@ pub fn main() !void {
     defer fd.close();
     var buf_reader = std.io.bufferedReader(fd.reader());
     const stream = buf_reader.reader();
+
+    var list = std.ArrayList(u8).init(std.heap.page_allocator);
+    defer list.deinit();
     {
         // std.debug.print("gzip header bytes: \n", .{});
         for (0..10) |_| {
@@ -313,53 +286,57 @@ pub fn main() !void {
     // set up bitreader
     var br = bitReader(stream);
     br.refill();
-    var state: BlockState = BlockState.init(&br);
-    state.show(); // show the header values
+    var pos: usize = 0;
+    while (true) {
+        var state: BlockState = BlockState.init(&br);
+        var data = [_]Symlen{Symlen{ .symbol = 0, .length = 0 }} ** MAXCODES;
+        br.refill();
+        for (0..@as(usize, state.hclen) + 4) |i| {
+            data[CodeLengthLookup[i]].length = @truncate(br.getbits(3));
+        }
+        var lenljbase = [_]u16{0} ** MAXCODELEN;
+        var lenprefixstart = [_]u16{0} ** 8;
+        var lenoffset = [_]u16{0} ** MAXCODELEN;
+        var len_tbl: HuffTable = .{
+            .data = data[0..CodeLengthLookup.len],
+            .lj_base = lenljbase[0..],
+            .prefix_size = 3,
+            .prefix_start = lenprefixstart[0..],
+            .offset = lenoffset[0..],
+        };
+        buildHuffTable(&len_tbl);
+        // resize data slice to hold literal/length codes
+        const codelen_count = @as(u9, state.hlit) + @as(u9, state.hdist) + 258;
+        len_tbl.data = data[0..codelen_count];
+        buildLitLen(&br, &len_tbl);
 
-    // var codelens = [_]u4{0} ** MAXCODES;
-    var data = [_]Symlen{Symlen{ .symbol = 0, .length = 0 }} ** MAXCODES;
-    br.refill();
-    for (0..@as(usize, state.hclen) + 4) |i| {
-        data[CodeLengthLookup[i]].length = @truncate(br.getbits(3));
+        // build literals tables
+        var litljbase = [_]u16{0} ** MAXCODELEN;
+        var litprefixstart = [_]u16{0} ** (1 << 3); // 2^3 prefix
+        var litoffset = [_]u16{0} ** MAXCODELEN;
+        var literals: HuffTable = .{
+            .data = data[0 .. @as(u16, state.hlit) + 257],
+            .lj_base = litljbase[0..],
+            .prefix_size = 3,
+            .prefix_start = litprefixstart[0..],
+            .offset = litoffset[0..],
+        };
+        buildHuffTable(&literals);
+        // build distances tables
+        var distljbase = [_]u16{0} ** MAXCODELEN;
+        var distprefixstart = [_]u16{0} ** (1 << 3); // 2^3 prefix
+        var distoffset = [_]u16{0} ** MAXCODELEN;
+        var distances: HuffTable = .{
+            .data = data[@as(u16, state.hlit) + 257 ..][0 .. @as(u16, state.hdist) + 1],
+            .lj_base = distljbase[0..],
+            .prefix_size = 3,
+            .prefix_start = distprefixstart[0..],
+            .offset = distoffset[0..],
+        };
+        buildHuffTable(&distances);
+        try inflate(&br, &list, &pos, &literals, &distances);
+        if (state.bfinal == 1)
+            break;
     }
-    var lenljbase = [_]u16{0} ** MAXCODELEN;
-    var lenprefixstart = [_]u16{0} ** 8;
-    var lenoffset = [_]u16{0} ** MAXCODELEN;
-    var len_tbl: HuffTable = .{
-        .data = data[0..CodeLengthLookup.len],
-        .lj_base = lenljbase[0..],
-        .prefix_size = 3,
-        .prefix_start = lenprefixstart[0..],
-        .offset = lenoffset[0..],
-    };
-    buildHuffTable(&len_tbl, 3);
-    // resize data slice to hold literal/length codes
-    const codelen_count = @as(u9, state.hlit) + @as(u9, state.hdist) + 258;
-    len_tbl.data = data[0..codelen_count];
-    buildLitLen(&br, &len_tbl);
-
-    // literals slice
-    var litljbase = [_]u16{0} ** MAXCODELEN;
-    var litprefixstart = [_]u16{0} ** (1 << 3); // 2^3 prefix
-    var litoffset = [_]u16{0} ** MAXCODELEN;
-    var literals: HuffTable = .{
-        .data = data[0 .. @as(u16, state.hlit) + 257],
-        .lj_base = litljbase[0..],
-        .prefix_size = 3,
-        .prefix_start = litprefixstart[0..],
-        .offset = litoffset[0..],
-    };
-    buildHuffTable(&literals, 8);
-    var distljbase = [_]u16{0} ** MAXCODELEN;
-    var distprefixstart = [_]u16{0} ** (1 << 3); // 2^3 prefix
-    var distoffset = [_]u16{0} ** MAXCODELEN;
-    var distances: HuffTable = .{
-        .data = data[@as(u16, state.hlit) + 257 ..][0 .. @as(u16, state.hdist) + 1],
-        .lj_base = distljbase[0..],
-        .prefix_size = 3,
-        .prefix_start = distprefixstart[0..],
-        .offset = distoffset[0..],
-    };
-    buildHuffTable(&distances, 3);
-    try inflate(&br, &literals, &distances);
+    try stdout.print("{s}", .{list.items});
 }
