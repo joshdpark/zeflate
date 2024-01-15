@@ -9,7 +9,7 @@ const std = @import("std");
 const io = std.io;
 const assert = std.debug.assert;
 const stdout = std.io.getStdOut().writer();
-const bitReader = @import("bitreader_naive.zig").bitReader;
+// const bitReader = @import("bitreader_naive.zig").bitReader;
 
 const MAXLITCODES = 286; // (257 - 286)
 const MAXDISTCODES = 30; // (1-32)
@@ -19,6 +19,75 @@ const MAXCODELEN = 16; // maximum number of bits in a huffman code;
 // hard coded tables in the rfc
 // rfc 3.2.7 under (HCLEN + 4) in block format
 const CodeLengthLookup = [_]u5{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+
+const Variant4 = struct {
+    bitptr: usize = 0, // ptr to the stream
+    bitbuf: u64 = 0, // bit buffer
+    bitcount: u6 = 0, // number of bits in bitbuf
+    buf: []u8,
+
+    const Self = @This();
+
+    pub fn refill(self: *Self) void {
+        // grab the next word and insert them right above the current top
+        self.bitbuf |= self.read64() << self.bitcount;
+
+        // advance the ptr for next iteration
+        self.bitptr += (63 - self.bitcount) >> 3;
+
+        // update the bitcount
+        self.bitcount |= 56; // 0b111000; bitcount is in [56,63)
+    }
+
+    fn read64(self: *Self) u64 {
+        if (self.bitptr + 8 <= self.buf.len) {
+            return @bitCast(self.buf[self.bitptr..][0..8].*);
+        } else {
+            var end: u64 = 0;
+            var shift: u6 = 0;
+            for (self.buf[self.bitptr..]) |byte| {
+                end <<= shift;
+                end |= byte;
+                shift += 8;
+            }
+            return end;
+        }
+    }
+
+    fn peek_msb(self: *Self, n: u6) u64 {
+        var code: u64 = 0;
+        var buf = self.bitbuf;
+        for (0..n) |_| {
+            code <<= 1;
+            code |= buf & 1;
+            buf >>= 1;
+        }
+        return code;
+    }
+
+    fn peek_lsb(self: *Self, count: u6) u64 {
+        assert(count >= 0 and count <= 56);
+        assert(count <= self.bitcount);
+
+        const mask: u64 = (@as(u64, 1) << count) - 1;
+
+        return self.bitbuf & mask;
+    }
+
+    fn consume(self: *Self, count: u6) void {
+        if (count <= self.bitcount)
+            self.refill();
+
+        self.bitbuf >>= count;
+        self.bitcount -= count;
+    }
+
+    fn getbits(self: *Self, count: u6) u64 {
+        const bits = self.peek_lsb(count);
+        self.consume(count);
+        return bits;
+    }
+};
 
 /// a data structure for packing in a code length and a symbol index
 const Symlen = packed struct {
@@ -246,9 +315,6 @@ fn inflate(reader: anytype, list: *std.ArrayList(u8), pos: *usize, literals: *Hu
             const distance = distbase[distcode] + dist_extra;
 
             for (0..len) |_| {
-                // if (pos < distance) {
-                //     std.debug.print("pos: {d}, dist: {d}\n", .{ pos, distance });
-                // }
                 try list.append(list.items[pos.* - distance]);
                 pos.* += 1;
             }
@@ -263,11 +329,15 @@ pub fn main() !void {
     const filename = args[1];
     const fd = try std.fs.cwd().openFile(filename, .{});
     defer fd.close();
+
+    const file_size = try fd.getEndPos();
     var buf_reader = std.io.bufferedReader(fd.reader());
     const stream = buf_reader.reader();
 
-    var list = std.ArrayList(u8).init(std.heap.page_allocator);
-    defer list.deinit();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
     {
         // std.debug.print("gzip header bytes: \n", .{});
         for (0..10) |_| {
@@ -283,12 +353,22 @@ pub fn main() !void {
             // std.debug.print("{c}", .{byte});
         } else |_| {}
     }
-    // set up bitreader
-    var br = bitReader(stream);
+    const input = try allocator.alloc(u8, file_size);
+    // var input = std.ArrayList(u8).init(allocator);
+    defer allocator.free(input);
+
+    var list = std.ArrayList(u8).init(allocator);
+    defer list.deinit();
+
+    var buf_stdout = std.io.bufferedWriter(stdout);
+    const bstdout = buf_stdout.writer();
+    _ = try stream.readAll(input);
+
+    var br = Variant4{ .buf = input };
     br.refill();
     var pos: usize = 0;
     while (true) {
-        var state: BlockState = BlockState.init(&br);
+        const state: BlockState = BlockState.init(&br);
         var data = [_]Symlen{Symlen{ .symbol = 0, .length = 0 }} ** MAXCODES;
         br.refill();
         for (0..@as(usize, state.hclen) + 4) |i| {
@@ -338,5 +418,5 @@ pub fn main() !void {
         if (state.bfinal == 1)
             break;
     }
-    try stdout.print("{s}", .{list.items});
+    try bstdout.print("{s}", .{list.items});
 }
