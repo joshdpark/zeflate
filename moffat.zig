@@ -189,6 +189,9 @@ const HuffTable = struct {
 /// The deflate format specifies that the run-length encoded symbols 0-18 are encoded by
 /// the number of code lengths
 /// from an array of ranges, build a huffman tree
+/// TODO: create an accelerated table with sym;len that is based on a prefix (max 8) that
+/// will automatically get the symbol and code length. If code length > the max that the
+/// prefix will show, then try out the slower method; Do this after finishing the encoder.
 fn buildHuffTable(h: *HuffTable) void {
     // codelength count table
     var freq = [_]u16{0} ** MAXCODELEN;
@@ -391,13 +394,14 @@ pub fn main() !void {
         buildLitLen(&br, &len_tbl);
 
         // build literals tables
+        const literals_prefix_size = 3;
         var litljbase = [_]u16{0} ** MAXCODELEN;
-        var litprefixstart = [_]u16{0} ** (1 << 3); // 2^3 prefix
+        var litprefixstart = [_]u16{0} ** (1 << literals_prefix_size);
         var litoffset = [_]u16{0} ** MAXCODELEN;
         var literals: HuffTable = .{
             .data = data[0 .. @as(u16, state.hlit) + 257],
             .lj_base = litljbase[0..],
-            .prefix_size = 3,
+            .prefix_size = literals_prefix_size,
             .prefix_start = litprefixstart[0..],
             .offset = litoffset[0..],
         };
