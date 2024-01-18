@@ -147,7 +147,6 @@ test match {
     try expect(std.meta.eql(match("aaabbbaaaaaaccc", 9).?, Pointer{ .offset = 3, .len = 3 }));
 }
 
-// TODO: we are also not searching for the longest match, just the first match.
 fn naive_lz77(input: []const u8, list: anytype) !void {
     // no need to start cursor at the beginning since we're matching on a sliding window of 3 bytes
     var cursor: usize = 3;
