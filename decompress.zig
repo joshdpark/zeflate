@@ -8,8 +8,7 @@
 const std = @import("std");
 const io = std.io;
 const assert = std.debug.assert;
-const stdout = std.io.getStdOut().writer();
-// const bitReader = @import("bitreader_naive.zig").bitReader;
+const stdout = std.io.getStdOut();
 
 const MAXLITCODES = 286; // (257 - 286)
 const MAXDISTCODES = 30; // (1-32)
@@ -20,74 +19,101 @@ const MAXCODELEN = 16; // maximum number of bits in a huffman code;
 // rfc 3.2.7 under (HCLEN + 4) in block format
 const CodeLengthLookup = [_]u5{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
 
-const Variant4 = struct {
-    bitptr: usize = 0, // ptr to the stream
-    bitbuf: u64 = 0, // bit buffer
-    bitcount: u6 = 0, // number of bits in bitbuf
-    buf: []u8,
+fn Variant4(comptime ReaderType: type) type {
+    return struct {
+        reader: ReaderType,
+        buf: [4096]u8 = undefined,
+        bitptr: usize = 0, // ptr to the stream
+        bitbuf: u64 = 0, // bit buffer
+        bitcount: u6 = 0, // number of bits in bitbuf
 
-    const Self = @This();
+        const Self = @This();
 
-    pub fn refill(self: *Self) void {
-        // grab the next word and insert them right above the current top
-        self.bitbuf |= self.read64() << self.bitcount;
-
-        // advance the ptr for next iteration
-        self.bitptr += (63 - self.bitcount) >> 3;
-
-        // update the bitcount
-        self.bitcount |= 56; // 0b111000; bitcount is in [56,63)
-    }
-
-    fn read64(self: *Self) u64 {
-        if (self.bitptr + 8 <= self.buf.len) {
-            return @bitCast(self.buf[self.bitptr..][0..8].*);
-        } else {
-            var end: u64 = 0;
-            var shift: u6 = 0;
-            for (self.buf[self.bitptr..]) |byte| {
-                end <<= shift;
-                end |= byte;
-                shift += 8;
-            }
-            return end;
-        }
-    }
-
-    fn peek_msb(self: *Self, n: u6) u64 {
-        var code: u64 = 0;
-        var buf = self.bitbuf;
-        for (0..n) |_| {
-            code <<= 1;
-            code |= buf & 1;
-            buf >>= 1;
-        }
-        return code;
-    }
-
-    fn peek_lsb(self: *Self, count: u6) u64 {
-        assert(count >= 0 and count <= 56);
-        assert(count <= self.bitcount);
-
-        const mask: u64 = (@as(u64, 1) << count) - 1;
-
-        return self.bitbuf & mask;
-    }
-
-    fn consume(self: *Self, count: u6) void {
-        if (count <= self.bitcount)
+        // initialize the buf and the bitbuf
+        fn initialize(self: *Self) !void {
+            _ = try self.reader.read(self.buf[0..]);
             self.refill();
+        }
 
-        self.bitbuf >>= count;
-        self.bitcount -= count;
-    }
+        pub fn refill(self: *Self) void {
+            // grab the next word and insert them right above the current top
+            self.bitbuf |= self.read64() << self.bitcount;
 
-    fn getbits(self: *Self, count: u6) u64 {
-        const bits = self.peek_lsb(count);
-        self.consume(count);
-        return bits;
-    }
-};
+            // advance the ptr for next iteration
+            self.bitptr += (63 - self.bitcount) >> 3;
+
+            // update the bitcount
+            self.bitcount |= 56; // 0b111000; bitcount is in [56,63)
+        }
+
+        fn read64(self: *Self) u64 {
+            if (self.bitptr + 8 > self.buf.len) {
+                const left = self.lookahead();
+                if (left < 8) {
+                    var end: u64 = 0;
+                    var shift: u6 = 0;
+                    for (self.buf[self.bitptr..]) |byte| {
+                        end <<= shift;
+                        end |= byte;
+                        shift += 8;
+                    }
+                    return end;
+                }
+            }
+            return @bitCast(self.buf[self.bitptr..][0..8].*);
+        }
+
+        // read from stream into the buf
+        fn lookahead(self: *Self) usize {
+            const remaining = self.buf.len - self.bitptr;
+            @memcpy(self.buf[0..remaining], self.buf[self.bitptr..][0..remaining]);
+            // read into the top buffer
+            const left = self.reader.read(self.buf[remaining..]) catch @panic("read error");
+            self.bitptr = 0; // reset bitptr
+            return left;
+        }
+
+        fn peek_msb(self: *Self, n: u6) u64 {
+            var code: u64 = 0;
+            var buf = self.bitbuf;
+            for (0..n) |_| {
+                code <<= 1;
+                code |= buf & 1;
+                buf >>= 1;
+            }
+            return code;
+        }
+
+        fn peek_lsb(self: *Self, count: u6) u64 {
+            assert(count >= 0 and count <= 56);
+            assert(count <= self.bitcount);
+
+            const mask: u64 = (@as(u64, 1) << count) - 1;
+
+            return self.bitbuf & mask;
+        }
+
+        fn consume(self: *Self, count: u6) void {
+            // TODO: a single code read can use up to 15 bits for a literal, 15 + 5 bits for
+            // lengths, and x + 13 bits for distances.
+            if (count <= self.bitcount)
+                self.refill();
+
+            self.bitbuf >>= count;
+            self.bitcount -= count;
+        }
+
+        fn getbits(self: *Self, count: u6) u64 {
+            const bits = self.peek_lsb(count);
+            self.consume(count);
+            return bits;
+        }
+    };
+}
+
+fn variant4(reader: anytype) Variant4(@TypeOf(reader)) {
+    return .{ .reader = reader };
+}
 
 /// a data structure for packing in a code length and a symbol index
 const Symlen = packed struct {
@@ -139,33 +165,9 @@ const HuffTable = struct {
 
     const Self = @This();
 
-    // fn canonical_decode(self: *Self, reader: anytype) !u64 {
-    //     var length = self.minlen;
-    //     var code = reader.getcode(length);
-    //     while (code >= self.base[length] + self.freq[length]) : (length += 1) {
-    //         code <<= 1;
-    //         code |= reader.getbits(1);
-    //     }
-    //     const symbol_id = self.offset[length] + (code - self.base[length]);
-    //     return self.data[symbol_id].symbol;
-    // }
-
-    fn one_shift_decode(self: *Self, reader: anytype) !u64 {
-        const width: u6 = @truncate(self.maxlen);
-        const window = reader.peek_msb(width);
-        var length = self.minlen;
-        while (window >= self.lj_base[length + 1]) {
-            length += 1;
-        }
-        reader.consume(length);
-        const rshift = width - length;
-        const symbol_id = self.offset[length] + ((window - self.lj_base[length]) >> rshift);
-        return self.data[symbol_id].symbol;
-    }
-
     /// One additional advantage is that I don't have to store the minimum code length.
     /// That is already being precalculated in the prefix_start table.
-    fn table_lookup_decode(self: *Self, reader: anytype) !u16 {
+    fn lookup_decode(self: *Self, reader: anytype) !u16 {
         const width: u4 = self.maxlen;
         const prefix_size = self.prefix_size;
         const window = reader.peek_msb(width);
@@ -265,7 +267,7 @@ fn buildLitLen(br: anytype, decodeTable: *HuffTable) void {
     var i: usize = 0;
     var lens = decodeTable.data;
     while (i < lens.len) {
-        const code: u16 = try decodeTable.table_lookup_decode(br);
+        const code: u16 = try decodeTable.lookup_decode(br);
         var rep: usize = 1;
         lens[i].length = @truncate(code);
         if (code == 16) {
@@ -291,7 +293,56 @@ fn buildLitLen(br: anytype, decodeTable: *HuffTable) void {
     }
 }
 
-fn inflate(reader: anytype, list: *std.ArrayList(u8), pos: *usize, literals: *HuffTable, distances: *HuffTable) !void {
+fn WriteBuffer(comptime WriterType: type) type {
+    return struct {
+        writer: WriterType,
+        buf: [buflen]u8 = undefined,
+        cur: usize = halflen, // default to being at halfpoint
+
+        const Self = @This();
+        const buflen: usize = 1 << 16; // 64k
+        const halflen: usize = 1 << 15; // 32k
+
+        fn appendLiteral(self: *Self, byte: u8) void {
+            assert(self.cur < self.buf.len);
+            self.buf[self.cur] = byte;
+            self.cur += 1;
+        }
+
+        fn appendSequence(self: *Self, distance: usize, length: usize) void {
+            for (0..length) |_| {
+                const byte = self.buf[self.cur - distance];
+                self.appendLiteral(byte);
+            }
+        }
+
+        fn buffer_switch(self: *Self) !void {
+            // This assertion is for the fact that I don't swap out the lookbehind buffer
+            // until we get to a cursor location where the max max length of a lz
+            // <distance,length> pointer write could happen: 258 bytes.
+            assert(self.cur >= self.buf.len - 258);
+            const end = self.cur - halflen;
+            try self.write_out(end);
+            // we always need halflen worth of bytes in lookbehind
+            @memcpy(self.buf[0..halflen], self.buf[end..][0..halflen]);
+            // reset cursor to halfway point
+            self.cur = halflen;
+        }
+
+        fn write_out(self: *Self, end: usize) !void {
+            var w = self.writer.writer();
+            // try w.print("{s}", .{self.buf[0..end]});
+            _ = try w.write(self.buf[0..end]);
+            try self.writer.flush();
+        }
+    };
+}
+
+fn writeBuffer(writer: anytype) WriteBuffer(@TypeOf(writer)) {
+    return .{ .writer = writer };
+}
+
+fn inflate(reader: anytype, writer: anytype, literals: *HuffTable, distances: *HuffTable) !void {
     // base lengths/distances and how many extra bits to consume and how
     // rfc 3.2.5
     const lenconsume = [_]u3{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
@@ -300,12 +351,12 @@ fn inflate(reader: anytype, list: *std.ArrayList(u8), pos: *usize, literals: *Hu
     const distbase = [_]u16{ 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
 
     var sym: u16 = undefined;
+    var ring = writeBuffer(writer);
     while (true) {
         // for (0..30) |_| {
-        sym = try literals.table_lookup_decode(reader);
+        sym = try literals.lookup_decode(reader);
         if (sym < 256) {
-            try list.append(@as(u8, @truncate(sym)));
-            pos.* += 1;
+            ring.appendLiteral(@as(u8, @truncate(sym)));
         } else if (sym == 256) {
             break;
         } else {
@@ -313,16 +364,20 @@ fn inflate(reader: anytype, list: *std.ArrayList(u8), pos: *usize, literals: *Hu
             const len_extra: u9 = @truncate(reader.getbits(lenconsume[lenid]));
             const len = lenbase[lenid] + len_extra;
 
-            const distcode = try distances.table_lookup_decode(reader);
+            const distcode = try distances.lookup_decode(reader);
             const dist_extra: usize = reader.getbits(distconsume[distcode]);
             const distance = distbase[distcode] + dist_extra;
 
-            for (0..len) |_| {
-                try list.append(list.items[pos.* - distance]);
-                pos.* += 1;
-            }
+            ring.appendSequence(distance, len);
         }
+        // swap out the front of the buffer into the back
+        if (ring.cur >= ring.buf.len)
+            try ring.buffer_switch();
     }
+
+    // if the buffer isn't empty write it out
+    if (ring.cur > 0)
+        try ring.write_out(ring.cur);
 }
 pub fn main() !void {
     var sfa = std.heap.stackFallback(1024, std.heap.page_allocator);
@@ -333,13 +388,9 @@ pub fn main() !void {
     const fd = try std.fs.cwd().openFile(filename, .{});
     defer fd.close();
 
-    const file_size = try fd.getEndPos();
-    var buf_reader = std.io.bufferedReader(fd.reader());
-    const stream = buf_reader.reader();
-
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var breader = std.io.bufferedReader(fd.reader());
+    const stream = breader.reader();
+    const bstdout = std.io.bufferedWriter(stdout.writer());
 
     {
         // std.debug.print("gzip header bytes: \n", .{});
@@ -356,20 +407,9 @@ pub fn main() !void {
             // std.debug.print("{c}", .{byte});
         } else |_| {}
     }
-    const input = try allocator.alloc(u8, file_size);
-    // var input = std.ArrayList(u8).init(allocator);
-    defer allocator.free(input);
 
-    var list = std.ArrayList(u8).init(allocator);
-    defer list.deinit();
-
-    var buf_stdout = std.io.bufferedWriter(stdout);
-    const bstdout = buf_stdout.writer();
-    _ = try stream.readAll(input);
-
-    var br = Variant4{ .buf = input };
-    br.refill();
-    var pos: usize = 0;
+    var br = variant4(stream);
+    try br.initialize();
     while (true) {
         const state: BlockState = BlockState.init(&br);
         var data = [_]Symlen{Symlen{ .symbol = 0, .length = 0 }} ** MAXCODES;
@@ -418,9 +458,9 @@ pub fn main() !void {
             .offset = distoffset[0..],
         };
         buildHuffTable(&distances);
-        try inflate(&br, &list, &pos, &literals, &distances);
+        try inflate(&br, bstdout, &literals, &distances);
         if (state.bfinal == 1)
             break;
     }
-    try bstdout.print("{s}", .{list.items});
+    // try bstdout.writer().print("{s}", .{list.items});
 }
