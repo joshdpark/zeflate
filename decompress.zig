@@ -293,6 +293,17 @@ fn buildLitLen(br: anytype, decodeTable: *HuffTable) void {
     }
 }
 
+// TODO: names are sloppy
+/// the deflate rfc states that the lookbehind buffer for LZ77 decoding
+/// has a maximum length of 32,768 (32k elements) and so we keep a back
+/// buffer to make sure that we can read back to that max length. Once
+/// our cur pointer has advanced far enough, we can replace the back
+/// buffer with the forward buffer.
+/// +-------------------------------------------------------------------+
+/// |                         buf[65,536 + 258]                         |
+/// +------------------+------------------+-----------------------------+
+/// | 32 k back buffer | 32k front buffer | 258 extra bytes for padding |
+/// +------------------+------------------+-----------------------------+
 fn WriteBuffer(comptime WriterType: type) type {
     return struct {
         writer: WriterType,
@@ -300,10 +311,10 @@ fn WriteBuffer(comptime WriterType: type) type {
         cur: usize = halflen, // default to being at halfpoint
 
         const Self = @This();
-        const buflen: usize = 1 << 16; // 64k
-        const halflen: usize = 1 << 15; // 32k
+        const buflen: usize = 1 << 16; // 65,536 bytes
+        const halflen: usize = 1 << 15; // 32,768 bytes
 
-        fn appendLiteral(self: *Self, byte: u8) void {
+        fn appendByte(self: *Self, byte: u8) void {
             assert(self.cur < self.buf.len);
             self.buf[self.cur] = byte;
             self.cur += 1;
@@ -312,28 +323,29 @@ fn WriteBuffer(comptime WriterType: type) type {
         fn appendSequence(self: *Self, distance: usize, length: usize) void {
             for (0..length) |_| {
                 const byte = self.buf[self.cur - distance];
-                self.appendLiteral(byte);
+                self.appendByte(byte);
             }
         }
 
-        fn buffer_switch(self: *Self) !void {
-            // This assertion is for the fact that I don't swap out the lookbehind buffer
-            // until we get to a cursor location where the max max length of a lz
-            // <distance,length> pointer write could happen: 258 bytes.
+        /// replace back buffer with front buffer with the bytes of padding and
+        /// then write back buffer to the out writer.
+        /// TODO: the final write is being handled manually, instead handle it
+        /// in a less adhoc way.
+        fn advance(self: *Self) !void {
             assert(self.cur >= buflen);
-            const end = self.cur - halflen;
-            try self.write_out(end);
-            // we always need halflen worth of bytes in lookbehind
-            @memcpy(self.buf[0..halflen], self.buf[end..][0..halflen]);
-            // reset cursor to halfway point
-            self.cur = halflen;
-        }
+            const back = self.buf[0..halflen];
+            const front = self.buf[halflen..buflen];
+            const extra = self.cur - buflen;
+            @memcpy(back, front);
+            @memcpy(self.buf[halflen..][0..extra], self.buf[buflen..][0..extra]);
 
-        fn write_out(self: *Self, end: usize) !void {
+            // write out back buffer and flush
             var w = self.writer.writer();
-            // try w.print("{s}", .{self.buf[0..end]});
-            _ = try w.write(self.buf[0..end]);
+            _ = try w.write(back);
             try self.writer.flush();
+
+            // reset pointer
+            self.cur = halflen + extra;
         }
     };
 }
@@ -342,7 +354,7 @@ fn writeBuffer(writer: anytype) WriteBuffer(@TypeOf(writer)) {
     return .{ .writer = writer };
 }
 
-fn inflate(reader: anytype, writer: anytype, literals: *HuffTable, distances: *HuffTable) !void {
+fn inflate(reader: anytype, ring: anytype, literals: *HuffTable, distances: *HuffTable) !void {
     // base lengths/distances and how many extra bits to consume and how
     // rfc 3.2.5
     const lenconsume = [_]u3{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
@@ -351,12 +363,11 @@ fn inflate(reader: anytype, writer: anytype, literals: *HuffTable, distances: *H
     const distbase = [_]u16{ 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
 
     var sym: u16 = undefined;
-    var ring = writeBuffer(writer);
     while (true) {
         // for (0..30) |_| {
         sym = try literals.lookup_decode(reader);
         if (sym < 256) {
-            ring.appendLiteral(@as(u8, @truncate(sym)));
+            ring.appendByte(@as(u8, @truncate(sym)));
         } else if (sym == 256) {
             break;
         } else {
@@ -372,12 +383,8 @@ fn inflate(reader: anytype, writer: anytype, literals: *HuffTable, distances: *H
         }
         // swap out the front of the buffer into the back
         if (ring.cur >= ring.buf.len - 258)
-            try ring.buffer_switch();
+            try ring.advance();
     }
-
-    // if the buffer isn't empty write it out
-    if (ring.cur > 0)
-        try ring.write_out(ring.cur);
 }
 pub fn main() !void {
     var sfa = std.heap.stackFallback(1024, std.heap.page_allocator);
@@ -422,6 +429,7 @@ pub fn main() !void {
 
     var br = variant4(stream);
     try br.initialize();
+    var ring = writeBuffer(bstdout);
     while (true) {
         const state: BlockState = BlockState.init(&br);
         // state.show();
@@ -471,9 +479,13 @@ pub fn main() !void {
             .offset = distoffset[0..],
         };
         buildHuffTable(&distances);
-        try inflate(&br, bstdout, &literals, &distances);
+        try inflate(&br, &ring, &literals, &distances);
         if (state.bfinal == 1)
             break;
     }
-    // try bstdout.writer().print("{s}", .{list.items});
+    // write out the leftovers in the buffer
+    // TODO: this is a hack, formalize this
+    if (ring.cur > 1 << 15) {
+        _ = try ring.writer.writer().write(ring.buf[1 << 15 .. ring.cur]);
+    }
 }
