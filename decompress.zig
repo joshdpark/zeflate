@@ -20,6 +20,9 @@ const MAXCODELEN = 16; // maximum number of bits in a huffman code;
 const PREFIX_SIZE = 3; // prefix length for code lookup TODO: write doc on this
 const PREFIX_LEN = 1 << PREFIX_SIZE;
 
+const MAXFASTLOOKUP = 9;
+const MAXFASTLOOKUPSIZE = 1 << MAXFASTLOOKUP;
+
 // hard coded tables in the rfc
 // rfc 3.2.7 under (HCLEN + 4) in block format
 const CodeLengthLookup = [_]u5{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
@@ -70,6 +73,7 @@ const HTable = struct {
     // code words.
     lenmap: [MAXCODELEN]LenMap = undefined,
     prefix_start: [PREFIX_LEN]u16 = [_]u16{0} ** PREFIX_LEN,
+    fast_lookup: [MAXFASTLOOKUPSIZE]Symlen = undefined,
 
     const Self = @This();
     const prefix_size = PREFIX_SIZE;
@@ -191,6 +195,20 @@ const HTable = struct {
                 }
             }
             i += rep;
+        }
+    }
+
+    fn accelerate_decode(self: *Self, reader: anytype) !u16 {
+        // TODO: currently peeking 15 bits, but maybe have that be in a
+        // constant somewhere
+        const peek = reader.peek_msb(MAXCODELEN);
+        const window = peek >> (MAXCODELEN - MAXFASTLOOKUP);
+        if (window < self.lj_base[MAXFASTLOOKUP + 1]) {
+            const sym = self.fast_lookup[window];
+            reader.consume(sym.length);
+            return sym.symbol;
+        } else {
+            return self.lookup_decode(reader);
         }
     }
 
