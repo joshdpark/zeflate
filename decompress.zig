@@ -6,6 +6,7 @@
 /// code length: the number of bits that make up a code word
 /// symbol: the encoded byte that a huffman code word maps to
 const std = @import("std");
+const mem = std.mem;
 const io = std.io;
 const assert = std.debug.assert;
 const stdout = std.io.getStdOut();
@@ -321,10 +322,10 @@ fn WriteBuffer(comptime WriterType: type) type {
         }
 
         fn appendSequence(self: *Self, distance: usize, length: usize) void {
-            for (0..length) |_| {
-                const byte = self.buf[self.cur - distance];
-                self.appendByte(byte);
-            }
+            const dst = self.buf[self.cur..][0..length];
+            const src = self.buf[self.cur - distance ..][0..length];
+            mem.copyForwards(u8, dst, src);
+            self.cur += length;
         }
 
         /// replace back buffer with front buffer with the bytes of padding and
@@ -399,6 +400,7 @@ pub fn main() !void {
     const stream = breader.reader();
     const bstdout = std.io.bufferedWriter(stdout.writer());
 
+    // all of this is to just handle the gzip specification
     {
         // std.debug.print("gzip header bytes: \n", .{});
         const filetype = try stream.readInt(u16, .little);
