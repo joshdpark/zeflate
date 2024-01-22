@@ -75,14 +75,7 @@ fn Variant4(comptime ReaderType: type) type {
         }
 
         fn peek_msb(self: *Self, n: u6) u64 {
-            var code: u64 = 0;
-            var buf = self.bitbuf;
-            for (0..n) |_| {
-                code <<= 1;
-                code |= buf & 1;
-                buf >>= 1;
-            }
-            return code;
+            return @bitReverse(self.bitbuf << (63 - n + 1));
         }
 
         fn peek_lsb(self: *Self, count: u6) u64 {
@@ -365,11 +358,10 @@ fn inflate(reader: anytype, ring: anytype, literals: *HuffTable, distances: *Huf
 
     var sym: u16 = undefined;
     while (true) {
-        // for (0..30) |_| {
         sym = try literals.lookup_decode(reader);
         if (sym < 256) {
             ring.appendByte(@as(u8, @truncate(sym)));
-        } else if (sym == 256) {
+        } else if (sym == 256) { // end of block
             break;
         } else {
             const lenid: usize = sym - 257;
