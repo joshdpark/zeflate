@@ -296,7 +296,7 @@ fn buildLitLen(br: anytype, decodeTable: *HuffTable) void {
 fn WriteBuffer(comptime WriterType: type) type {
     return struct {
         writer: WriterType,
-        buf: [buflen]u8 = undefined,
+        buf: [buflen + 258]u8 = undefined,
         cur: usize = halflen, // default to being at halfpoint
 
         const Self = @This();
@@ -320,7 +320,7 @@ fn WriteBuffer(comptime WriterType: type) type {
             // This assertion is for the fact that I don't swap out the lookbehind buffer
             // until we get to a cursor location where the max max length of a lz
             // <distance,length> pointer write could happen: 258 bytes.
-            assert(self.cur >= self.buf.len - 258);
+            assert(self.cur >= buflen);
             const end = self.cur - halflen;
             try self.write_out(end);
             // we always need halflen worth of bytes in lookbehind
@@ -371,7 +371,7 @@ fn inflate(reader: anytype, writer: anytype, literals: *HuffTable, distances: *H
             ring.appendSequence(distance, len);
         }
         // swap out the front of the buffer into the back
-        if (ring.cur >= ring.buf.len)
+        if (ring.cur >= ring.buf.len - 258)
             try ring.buffer_switch();
     }
 
@@ -394,24 +394,37 @@ pub fn main() !void {
 
     {
         // std.debug.print("gzip header bytes: \n", .{});
-        for (0..10) |_| {
-            _ = try stream.readByte();
-            // std.debug.print("{x} ", .{try stream.readByte()});
+        const filetype = try stream.readInt(u16, .little);
+        // std.debug.print("filetype: {x}\n", .{filetype});
+        if (filetype != 0x8b1f)
+            @panic("not a gzip");
+        const isdeflate = try stream.readByte();
+        if (isdeflate != 8)
+            @panic("not deflate compression");
+        const flags = try stream.readByte();
+        const name = (flags >> 3) & 1;
+        // std.debug.print("flags: {b:0>8}", .{flags});
+        const mtime = try stream.readInt(i32, .little);
+        _ = mtime;
+        const xfl = try stream.readByte();
+        _ = xfl;
+        const os = try stream.readByte();
+        _ = os;
+        if (name > 0) {
+            // std.debug.print("\nfilename: ", .{});
+            while (stream.readByte()) |byte| {
+                if (byte == 0)
+                    break;
+                // std.debug.print("{c}", .{byte});
+            } else |_| {}
         }
-    }
-    {
-        // std.debug.print("\nfilename: ", .{});
-        while (stream.readByte()) |byte| {
-            if (byte == 0)
-                break;
-            // std.debug.print("{c}", .{byte});
-        } else |_| {}
     }
 
     var br = variant4(stream);
     try br.initialize();
     while (true) {
         const state: BlockState = BlockState.init(&br);
+        // state.show();
         var data = [_]Symlen{Symlen{ .symbol = 0, .length = 0 }} ** MAXCODES;
         br.refill();
         for (0..@as(usize, state.hclen) + 4) |i| {
