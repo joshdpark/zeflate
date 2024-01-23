@@ -15,12 +15,14 @@ const MAXLITCODES = 286; // (257 - 286)
 const MAXDISTCODES = 30; // (1-32)
 const MAXCODES = MAXLITCODES + MAXDISTCODES;
 const MAXCODELEN = 16; // maximum number of bits in a huffman code;
+const PREFIX_SIZE = 3; // prefix length for code lookup TODO: write doc on this
+const PREFIX_LEN = 1 << PREFIX_SIZE;
 
 // hard coded tables in the rfc
 // rfc 3.2.7 under (HCLEN + 4) in block format
 const CodeLengthLookup = [_]u5{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
 
-fn Variant4(comptime ReaderType: type) type {
+fn BitReader(comptime ReaderType: type) type {
     return struct {
         reader: ReaderType,
         buf: [4096]u8 = undefined,
@@ -75,6 +77,7 @@ fn Variant4(comptime ReaderType: type) type {
         }
 
         fn peek_msb(self: *Self, n: u6) u64 {
+            assert(n > 0);
             return @bitReverse(self.bitbuf << (63 - n + 1));
         }
 
@@ -105,24 +108,24 @@ fn Variant4(comptime ReaderType: type) type {
     };
 }
 
-fn variant4(reader: anytype) Variant4(@TypeOf(reader)) {
+fn bitReader(reader: anytype) BitReader(@TypeOf(reader)) {
     return .{ .reader = reader };
 }
 
 /// a data structure for packing in a code length and a symbol index
 const Symlen = packed struct {
-    symbol: u9,
+    symbol: u12,
     length: u4,
 };
 
-const BlockState = struct {
+const BlockHeader = struct {
     bfinal: u1,
     btype: u2,
     hlit: u5,
     hdist: u5,
     hclen: u4,
 
-    fn init(r: anytype) BlockState {
+    fn init(r: anytype) BlockHeader {
         return .{
             .bfinal = @truncate(r.getbits(1)),
             .btype = @truncate(r.getbits(2)),
@@ -132,7 +135,7 @@ const BlockState = struct {
         };
     }
 
-    fn show(self: *BlockState) void {
+    fn show(self: *BlockHeader) void {
         std.debug.print(
             \\{d} (hlit) literal codes (257-286 literals)
             \\{d} (hdist) distance codes (1-32)
@@ -142,28 +145,129 @@ const BlockState = struct {
     }
 };
 
-///TODO: this is a lot of book-keeping right now. Most of this state doesn't need to be
-///stored in the struct. A lot of it can be calculated on the fly, which can reduce the
-///amount of registers that are needed.
-const HuffTable = struct {
+const HTable = struct {
     data: []Symlen,
     minlen: u4 = MAXCODELEN - 1, // the minimum code word length
     maxlen: u4 = 0, // the maximum code word length (1-15)
     // the left-justified (lj) base table is basically all the code words for each symbol
     // but left-shifted so that they all have a bit-length of the maximum number of
     // code words.
-    lj_base: []u16,
-    prefix_size: u4, // TODO: make this compile time known
-    prefix_start: []u16,
-    offset: []u16,
+    lj_base: [MAXCODELEN]u16 = [_]u16{0} ** MAXCODELEN,
+    prefix_start: [PREFIX_LEN]u16 = [_]u16{0} ** PREFIX_LEN,
+    offset: [MAXCODELEN]u16 = [_]u16{0} ** MAXCODELEN,
 
     const Self = @This();
+    const prefix_size = PREFIX_SIZE;
+
+    /// NOTES:
+    /// A 'symbol' is the byte that is being encoded in a huffman code
+    /// A 'code' is a variable number of bits that decodes to a symbol
+    /// A 'code length' aka 'hclen' (huffman code length) is the number of bits that makes up the code
+    /// The deflate format specifies that the run-length encoded symbols 0-18 are encoded by
+    /// the number of code lengths from an array of ranges, build a huffman tree
+    fn buildHuffTable(h: *HTable) void {
+        // codelength count table
+        var freq = [_]u16{0} ** MAXCODELEN;
+        for (h.data) |item| {
+            const len = item.length;
+            freq[len] += 1;
+            h.maxlen = @max(len, h.maxlen);
+            h.minlen = if (len != 0) @min(len, h.minlen) else h.minlen;
+        }
+
+        // lj_base table
+        {
+            var code: u16 = 0;
+            freq[0] = 0;
+            var i: u4 = h.minlen;
+            while (i <= h.maxlen) : (i += 1) {
+                code = (code + freq[i - 1]) << 1;
+                h.lj_base[i] = code << (h.maxlen - i);
+            }
+            // add sentinel value for absolute maximum code value
+            h.lj_base[h.maxlen + 1] = code << 1;
+        }
+
+        // prefix_start table
+        {
+            const w = prefix_size; // width of prefix
+            const rshift: u4 = h.maxlen - w; // amt to shift to get prefix width
+            var i: u4 = h.maxlen;
+            // Look at the prefix for each left-justified code, since we need to record
+            // the shortest length that matches that prefix.
+            while (i >= h.minlen) : (i -= 1) {
+                const base = h.lj_base[i] >> (h.maxlen - i); // get the base value of each length
+                const range = base + freq[i];
+                for (base..range) |b| {
+                    const lj = b << h.maxlen - i; // left justify the code
+                    const prefix = lj >> rshift; // keep the prefix
+                    h.prefix_start[prefix] = i;
+                }
+            }
+            // second pass to fill in the gaps for prefix values that weren't populated
+            var j: usize = 1;
+            while (j < h.prefix_start.len) : (j += 1) {
+                if (h.prefix_start[j - 1] != 0 and h.prefix_start[j] == 0)
+                    h.prefix_start[j] = h.prefix_start[j - 1];
+            }
+        }
+
+        // offset table
+        h.offset[1] = 0;
+        for (1..h.maxlen) |len| {
+            h.offset[len + 1] = h.offset[len] + freq[len];
+        }
+
+        // populate the symbol index section of data
+        var offset_copy: [MAXCODELEN]u16 = undefined;
+        @memcpy(offset_copy[0..], h.offset[0..]);
+        {
+            var symbol: u9 = 0;
+            while (symbol < h.data.len) : (symbol += 1) {
+                const len = h.data[symbol].length;
+                if (len != 0) {
+                    h.data[offset_copy[len]].symbol = symbol;
+                    offset_copy[len] += 1;
+                }
+            }
+        }
+    }
+
+    /// build the literals/length code table
+    fn buildLitLen(decodeTable: *HTable, br: anytype) void {
+        var i: usize = 0;
+        var lens = decodeTable.data;
+        while (i < lens.len) {
+            const code: u16 = try decodeTable.lookup_decode(br);
+            var rep: usize = 1;
+            lens[i].length = @truncate(code);
+            if (code == 16) {
+                rep = br.getbits(2) + 3;
+                const prev = lens[i - 1].length;
+                for (lens[i..][0..rep]) |*val| {
+                    val.*.length = prev;
+                }
+            }
+            if (code == 17) {
+                rep = br.getbits(3) + 3;
+                for (lens[i..][0..rep]) |*val| {
+                    val.*.length = 0;
+                }
+            }
+            if (code == 18) {
+                rep = br.getbits(7) + 11;
+                for (lens[i..][0..rep]) |*val| {
+                    val.*.length = 0;
+                }
+            }
+            i += rep;
+        }
+    }
 
     /// One additional advantage is that I don't have to store the minimum code length.
     /// That is already being precalculated in the prefix_start table.
     fn lookup_decode(self: *Self, reader: anytype) !u16 {
         const width: u4 = self.maxlen;
-        const prefix_size = self.prefix_size;
         const window = reader.peek_msb(width);
         const prefix = window >> (width - prefix_size);
         var length: u6 = @truncate(self.prefix_start[prefix]);
@@ -178,116 +282,6 @@ const HuffTable = struct {
     }
 };
 
-/// NOTES:
-/// A 'symbol' is the byte that is being encoded in a huffman code
-/// A 'code' is a variable number of bits that decodes to a symbol
-/// A 'code length' aka 'hclen' (huffman code length) is the number of bits that makes up the code
-/// The deflate format specifies that the run-length encoded symbols 0-18 are encoded by
-/// the number of code lengths
-/// from an array of ranges, build a huffman tree
-/// TODO: create an accelerated table with sym;len that is based on a prefix (max 8) that
-/// will automatically get the symbol and code length. If code length > the max that the
-/// prefix will show, then try out the slower method; Do this after finishing the encoder.
-fn buildHuffTable(h: *HuffTable) void {
-    // codelength count table
-    var freq = [_]u16{0} ** MAXCODELEN;
-    for (h.data) |item| {
-        const len = item.length;
-        freq[len] += 1;
-        h.maxlen = @max(len, h.maxlen);
-        h.minlen = if (len != 0) @min(len, h.minlen) else h.minlen;
-    }
-
-    // lj_base table
-    {
-        var code: u16 = 0;
-        freq[0] = 0;
-        var i: u4 = h.minlen;
-        while (i <= h.maxlen) : (i += 1) {
-            code = (code + freq[i - 1]) << 1;
-            h.lj_base[i] = code << (h.maxlen - i);
-        }
-        // add sentinel value for absolute maximum code value
-        h.lj_base[h.maxlen + 1] = code << 1;
-    }
-
-    // prefix_start table
-    {
-        const w = h.prefix_size; // width of prefix
-        const rshift: u4 = h.maxlen - w; // amt to shift to get prefix width
-        var i: u4 = h.maxlen;
-        // Look at the prefix for each left-justified code, since we need to record
-        // the shortest length that matches that prefix.
-        while (i >= h.minlen) : (i -= 1) {
-            const base = h.lj_base[i] >> (h.maxlen - i); // get the base value of each length
-            const range = base + freq[i];
-            for (base..range) |b| {
-                const lj = b << h.maxlen - i; // left justify the code
-                const prefix = lj >> rshift; // keep the prefix
-                h.prefix_start[prefix] = i;
-            }
-        }
-        // second pass to fill in the gaps for prefix values that weren't populated
-        var j: usize = 1;
-        while (j < h.prefix_start.len) : (j += 1) {
-            if (h.prefix_start[j - 1] != 0 and h.prefix_start[j] == 0)
-                h.prefix_start[j] = h.prefix_start[j - 1];
-        }
-    }
-
-    // offset table
-    h.offset[1] = 0;
-    for (1..h.maxlen) |len| {
-        h.offset[len + 1] = h.offset[len] + freq[len];
-    }
-
-    // populate the symbol index section of data
-    var offset_copy: [MAXCODELEN]u16 = undefined;
-    @memcpy(offset_copy[0..], h.offset);
-    {
-        var symbol: u9 = 0;
-        while (symbol < h.data.len) : (symbol += 1) {
-            const len = h.data[symbol].length;
-            if (len != 0) {
-                h.data[offset_copy[len]].symbol = symbol;
-                offset_copy[len] += 1;
-            }
-        }
-    }
-}
-
-/// build the literals/length code table
-fn buildLitLen(br: anytype, decodeTable: *HuffTable) void {
-    var i: usize = 0;
-    var lens = decodeTable.data;
-    while (i < lens.len) {
-        const code: u16 = try decodeTable.lookup_decode(br);
-        var rep: usize = 1;
-        lens[i].length = @truncate(code);
-        if (code == 16) {
-            rep = br.getbits(2) + 3;
-            const prev = lens[i - 1].length;
-            for (lens[i..][0..rep]) |*val| {
-                val.*.length = prev;
-            }
-        }
-        if (code == 17) {
-            rep = br.getbits(3) + 3;
-            for (lens[i..][0..rep]) |*val| {
-                val.*.length = 0;
-            }
-        }
-        if (code == 18) {
-            rep = br.getbits(7) + 11;
-            for (lens[i..][0..rep]) |*val| {
-                val.*.length = 0;
-            }
-        }
-        i += rep;
-    }
-}
-
-// TODO: names are sloppy
 /// the deflate rfc states that the lookbehind buffer for LZ77 decoding
 /// has a maximum length of 32,768 (32k elements) and so we keep a back
 /// buffer to make sure that we can read back to that max length. Once
@@ -298,7 +292,7 @@ fn buildLitLen(br: anytype, decodeTable: *HuffTable) void {
 /// +------------------+------------------+-----------------------------+
 /// | 32 k back buffer | 32k front buffer | 258 extra bytes for padding |
 /// +------------------+------------------+-----------------------------+
-fn WriteBuffer(comptime WriterType: type) type {
+fn RotateWriter(comptime WriterType: type) type {
     return struct {
         writer: WriterType,
         buf: [buflen + 258]u8 = undefined,
@@ -325,7 +319,7 @@ fn WriteBuffer(comptime WriterType: type) type {
         /// then write back buffer to the out writer.
         /// TODO: the final write is being handled manually, instead handle it
         /// in a less adhoc way.
-        fn advance(self: *Self) !void {
+        fn rotate(self: *Self) !void {
             assert(self.cur >= buflen);
             const back = self.buf[0..halflen];
             const front = self.buf[halflen..buflen];
@@ -344,11 +338,11 @@ fn WriteBuffer(comptime WriterType: type) type {
     };
 }
 
-fn writeBuffer(writer: anytype) WriteBuffer(@TypeOf(writer)) {
+fn rotateWriter(writer: anytype) RotateWriter(@TypeOf(writer)) {
     return .{ .writer = writer };
 }
 
-fn inflate(reader: anytype, ring: anytype, literals: *HuffTable, distances: *HuffTable) !void {
+fn inflate(reader: anytype, ring: anytype, literals: *HTable, distances: *HTable) !void {
     // base lengths/distances and how many extra bits to consume and how
     // rfc 3.2.5
     const lenconsume = [_]u3{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
@@ -376,9 +370,72 @@ fn inflate(reader: anytype, ring: anytype, literals: *HuffTable, distances: *Huf
         }
         // swap out the front of the buffer into the back
         if (ring.cur >= ring.buf.len - 258)
-            try ring.advance();
+            try ring.rotate();
     }
 }
+
+fn Decompressor(comptime ReaderType: type, comptime WriterType: type) type {
+    return struct {
+        bit_reader: ReaderType,
+        ring_writer: WriterType,
+
+        header: BlockHeader,
+        litlen_tbl: HTable, // codelen htable, reuse for literal/length htable
+        dist_tbl: HTable, // distance htable
+        data: [MAXCODES]Symlen = [_]Symlen{Symlen{ .symbol = 0, .length = 0 }} ** MAXCODES,
+
+        const Self = @This();
+
+        fn decode(self: *Self) !void {
+            try self.bit_reader.initialize();
+            while (true) {
+                self.header = BlockHeader.init(&self.bit_reader);
+                self.bit_reader.refill();
+                // populate codelen codelength table
+                for (0..@as(usize, self.header.hclen) + 4) |i| {
+                    self.data[CodeLengthLookup[i]].length = @truncate(self.bit_reader.getbits(3));
+                }
+                self.litlen_tbl = HTable{ .data = self.data[0..CodeLengthLookup.len] };
+                self.litlen_tbl.buildHuffTable();
+                // resize data slice to hold literal/length codes
+                const codelen_count = @as(u9, self.header.hlit) + @as(u9, self.header.hdist) + 258;
+                self.litlen_tbl.data = self.data[0..codelen_count];
+                self.litlen_tbl.buildLitLen(&self.bit_reader);
+
+                // build literals/lenght table
+                self.litlen_tbl = .{
+                    .data = self.data[0 .. @as(u16, self.header.hlit) + 257],
+                };
+                self.litlen_tbl.buildHuffTable();
+
+                // build distances tables
+                self.dist_tbl = HTable{
+                    .data = self.data[@as(u16, self.header.hlit) + 257 ..][0 .. @as(u16, self.header.hdist) + 1],
+                };
+                self.dist_tbl.buildHuffTable();
+                try inflate(&self.bit_reader, &self.ring_writer, &self.litlen_tbl, &self.dist_tbl);
+                if (self.header.bfinal == 1)
+                    break;
+            }
+            // write out the leftovers in the buffer
+            // TODO: this is a hack, formalize this
+            if (self.ring_writer.cur > 1 << 15) {
+                _ = try self.ring_writer.writer.writer().write(self.ring_writer.buf[1 << 15 .. self.ring_writer.cur]);
+            }
+        }
+    };
+}
+
+fn decompressor(reader: anytype, writer: anytype) Decompressor(BitReader(@TypeOf(reader)), RotateWriter(@TypeOf(writer))) {
+    return .{
+        .bit_reader = bitReader(reader),
+        .ring_writer = rotateWriter(writer),
+        .header = undefined,
+        .litlen_tbl = undefined,
+        .dist_tbl = undefined,
+    };
+}
+
 pub fn main() !void {
     var sfa = std.heap.stackFallback(1024, std.heap.page_allocator);
     const argsallocator = sfa.get();
@@ -421,65 +478,6 @@ pub fn main() !void {
         }
     }
 
-    var br = variant4(stream);
-    try br.initialize();
-    var ring = writeBuffer(bstdout);
-    while (true) {
-        const state: BlockState = BlockState.init(&br);
-        // state.show();
-        var data = [_]Symlen{Symlen{ .symbol = 0, .length = 0 }} ** MAXCODES;
-        br.refill();
-        for (0..@as(usize, state.hclen) + 4) |i| {
-            data[CodeLengthLookup[i]].length = @truncate(br.getbits(3));
-        }
-        var lenljbase = [_]u16{0} ** MAXCODELEN;
-        var lenprefixstart = [_]u16{0} ** 8;
-        var lenoffset = [_]u16{0} ** MAXCODELEN;
-        var len_tbl: HuffTable = .{
-            .data = data[0..CodeLengthLookup.len],
-            .lj_base = lenljbase[0..],
-            .prefix_size = 3,
-            .prefix_start = lenprefixstart[0..],
-            .offset = lenoffset[0..],
-        };
-        buildHuffTable(&len_tbl);
-        // resize data slice to hold literal/length codes
-        const codelen_count = @as(u9, state.hlit) + @as(u9, state.hdist) + 258;
-        len_tbl.data = data[0..codelen_count];
-        buildLitLen(&br, &len_tbl);
-
-        // build literals tables
-        const literals_prefix_size = 3;
-        var litljbase = [_]u16{0} ** MAXCODELEN;
-        var litprefixstart = [_]u16{0} ** (1 << literals_prefix_size);
-        var litoffset = [_]u16{0} ** MAXCODELEN;
-        var literals: HuffTable = .{
-            .data = data[0 .. @as(u16, state.hlit) + 257],
-            .lj_base = litljbase[0..],
-            .prefix_size = literals_prefix_size,
-            .prefix_start = litprefixstart[0..],
-            .offset = litoffset[0..],
-        };
-        buildHuffTable(&literals);
-        // build distances tables
-        var distljbase = [_]u16{0} ** MAXCODELEN;
-        var distprefixstart = [_]u16{0} ** (1 << 3); // 2^3 prefix
-        var distoffset = [_]u16{0} ** MAXCODELEN;
-        var distances: HuffTable = .{
-            .data = data[@as(u16, state.hlit) + 257 ..][0 .. @as(u16, state.hdist) + 1],
-            .lj_base = distljbase[0..],
-            .prefix_size = 3,
-            .prefix_start = distprefixstart[0..],
-            .offset = distoffset[0..],
-        };
-        buildHuffTable(&distances);
-        try inflate(&br, &ring, &literals, &distances);
-        if (state.bfinal == 1)
-            break;
-    }
-    // write out the leftovers in the buffer
-    // TODO: this is a hack, formalize this
-    if (ring.cur > 1 << 15) {
-        _ = try ring.writer.writer().write(ring.buf[1 << 15 .. ring.cur]);
-    }
+    var deflate_decoder = decompressor(stream, bstdout);
+    try deflate_decoder.decode();
 }
