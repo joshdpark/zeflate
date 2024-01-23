@@ -386,7 +386,7 @@ fn Decompressor(comptime ReaderType: type, comptime WriterType: type) type {
 
         const Self = @This();
 
-        fn decode(self: *Self) !void {
+        fn decompress(self: *Self) !void {
             try self.bit_reader.initialize();
             while (true) {
                 self.header = BlockHeader.init(&self.bit_reader);
@@ -479,5 +479,5 @@ pub fn main() !void {
     }
 
     var deflate_decoder = decompressor(stream, bstdout);
-    try deflate_decoder.decode();
+    try deflate_decoder.decompress();
 }
