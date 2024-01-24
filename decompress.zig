@@ -279,7 +279,7 @@ const HTable = struct {
 /// +-------------------------------------------------------------------+
 /// |                         buf[65,536 + 258]                         |
 /// +------------------+------------------+-----------------------------+
-/// | 32 k back buffer | 32k front buffer | 258 extra bytes for padding |
+/// | 32k back buffer  | 32k front buffer | 258 extra bytes for padding |
 /// +------------------+------------------+-----------------------------+
 fn RotateWriter(comptime WriterType: type) type {
     return struct {
@@ -316,13 +316,12 @@ fn RotateWriter(comptime WriterType: type) type {
             @memcpy(back, front);
             @memcpy(self.buf[halflen..][0..extra], self.buf[buflen..][0..extra]);
 
-            // write out back buffer and flush
-            var w = self.writer.writer();
-            _ = try w.write(back);
-            try self.writer.flush();
-
             // reset pointer
             self.cur = halflen + extra;
+        }
+
+        fn writeout(self: *Self) !void {
+            _ = try self.writer.write(self.buf[0..halflen]);
         }
     };
 }
@@ -359,8 +358,10 @@ fn inflate(reader: anytype, ring: anytype, literals: *HTable, distances: *HTable
             ring.appendSequence(distance, len);
         }
         // swap out the front of the buffer into the back
-        if (ring.cur >= ring.buf.len - 258)
+        if (ring.cur >= ring.buf.len - 258) {
             try ring.rotate();
+            try ring.writeout();
+        }
     }
 }
 
@@ -409,9 +410,7 @@ fn Decompressor(comptime ReaderType: type, comptime WriterType: type) type {
                     break;
             }
             // write out the leftovers in the buffer TODO: this is a hack, formalize this
-            if (self.ring_writer.cur > 1 << 15) {
-                _ = try self.ring_writer.writer.writer().write(self.ring_writer.buf[1 << 15 .. self.ring_writer.cur]);
-            }
+            _ = try self.ring_writer.writer.writer().write(self.ring_writer.buf[1 << 15 .. self.ring_writer.cur]);
         }
     };
 }
