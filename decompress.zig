@@ -51,17 +51,7 @@ fn BitReader(comptime ReaderType: type) type {
 
         fn read64(self: *Self) u64 {
             if (self.bitptr + 8 > self.buf.len) {
-                const left = self.lookahead();
-                if (left < 8) {
-                    var end: u64 = 0;
-                    var shift: u6 = 0;
-                    for (self.buf[self.bitptr..]) |byte| {
-                        end <<= shift;
-                        end |= byte;
-                        shift += 8;
-                    }
-                    return end;
-                }
+                _ = self.lookahead();
             }
             return @bitCast(self.buf[self.bitptr..][0..8].*);
         }
@@ -78,6 +68,7 @@ fn BitReader(comptime ReaderType: type) type {
 
         fn peek_msb(self: *Self, n: u6) u64 {
             assert(n > 0);
+
             return @bitReverse(self.bitbuf << (63 - n + 1));
         }
 
@@ -86,15 +77,11 @@ fn BitReader(comptime ReaderType: type) type {
             assert(count <= self.bitcount);
 
             const mask: u64 = (@as(u64, 1) << count) - 1;
-
             return self.bitbuf & mask;
         }
 
         fn consume(self: *Self, count: u6) void {
-            // TODO: a single code read can use up to 15 bits for a literal, 15 + 5 bits for
-            // lengths, and x + 13 bits for distances.
-            if (count <= self.bitcount)
-                self.refill();
+            assert(count <= self.bitcount);
 
             self.bitbuf >>= count;
             self.bitcount -= count;
@@ -145,6 +132,7 @@ const BlockHeader = struct {
     }
 };
 
+/// A huffman table used for entropy decoding variable sequences of bits
 const HTable = struct {
     data: []Symlen,
     minlen: u4 = MAXCODELEN - 1, // the minimum code word length
@@ -238,6 +226,7 @@ const HTable = struct {
         var i: usize = 0;
         var lens = decodeTable.data;
         while (i < lens.len) {
+            br.refill();
             const code: u16 = try decodeTable.lookup_decode(br);
             var rep: usize = 1;
             lens[i].length = @truncate(code);
@@ -352,18 +341,19 @@ fn inflate(reader: anytype, ring: anytype, literals: *HTable, distances: *HTable
 
     var sym: u16 = undefined;
     while (true) {
-        sym = try literals.lookup_decode(reader);
+        reader.refill();
+        sym = try literals.lookup_decode(reader); // literal, up to 15 bits
         if (sym < 256) {
             ring.appendByte(@as(u8, @truncate(sym)));
         } else if (sym == 256) { // end of block
             break;
         } else {
             const lenid: usize = sym - 257;
-            const len_extra: u9 = @truncate(reader.getbits(lenconsume[lenid]));
+            const len_extra: u9 = @truncate(reader.getbits(lenconsume[lenid])); // up to 5 extra bits
             const len = lenbase[lenid] + len_extra;
 
-            const distcode = try distances.lookup_decode(reader);
-            const dist_extra: usize = reader.getbits(distconsume[distcode]);
+            const distcode = try distances.lookup_decode(reader); // distance, up to 16 bits
+            const dist_extra: usize = reader.getbits(distconsume[distcode]); // up to 13 extra bits for 29 bits
             const distance = distbase[distcode] + dist_extra;
 
             ring.appendSequence(distance, len);
@@ -378,47 +368,47 @@ fn Decompressor(comptime ReaderType: type, comptime WriterType: type) type {
     return struct {
         bit_reader: ReaderType,
         ring_writer: WriterType,
-
-        header: BlockHeader,
-        litlen_tbl: HTable, // codelen htable, reuse for literal/length htable
-        dist_tbl: HTable, // distance htable
         data: [MAXCODES]Symlen = [_]Symlen{Symlen{ .symbol = 0, .length = 0 }} ** MAXCODES,
 
         const Self = @This();
 
+        fn dynamicDecodeBlock(self: *Self, header: *const BlockHeader) !void {
+            // populate codelen codelength table
+            self.bit_reader.refill();
+            for (0..@as(usize, header.hclen) + 4) |i| {
+                self.data[CodeLengthLookup[i]].length = @truncate(self.bit_reader.getbits(3));
+            }
+            var litlen = HTable{ .data = self.data[0..CodeLengthLookup.len] };
+            litlen.buildHuffTable();
+            // resize data slice to hold literal/length codes
+            const codelen_count = @as(usize, header.hlit) + @as(usize, header.hdist) + 258;
+            litlen.data = self.data[0..codelen_count];
+            litlen.buildLitLen(&self.bit_reader);
+
+            // build literals/length table
+            litlen = .{ .data = self.data[0 .. @as(u16, header.hlit) + 257] };
+            litlen.buildHuffTable();
+
+            // build distances tables
+            var dist = HTable{ .data = self.data[@as(usize, header.hlit) + 257 ..][0 .. @as(usize, header.hdist) + 1] };
+            dist.buildHuffTable();
+            try inflate(&self.bit_reader, &self.ring_writer, &litlen, &dist);
+        }
+
         fn decompress(self: *Self) !void {
             try self.bit_reader.initialize();
             while (true) {
-                self.header = BlockHeader.init(&self.bit_reader);
-                self.bit_reader.refill();
-                // populate codelen codelength table
-                for (0..@as(usize, self.header.hclen) + 4) |i| {
-                    self.data[CodeLengthLookup[i]].length = @truncate(self.bit_reader.getbits(3));
+                const header = BlockHeader.init(&self.bit_reader);
+                switch (header.btype) {
+                    0 => unreachable,
+                    1 => unreachable,
+                    2 => try dynamicDecodeBlock(self, &header),
+                    3 => unreachable,
                 }
-                self.litlen_tbl = HTable{ .data = self.data[0..CodeLengthLookup.len] };
-                self.litlen_tbl.buildHuffTable();
-                // resize data slice to hold literal/length codes
-                const codelen_count = @as(u9, self.header.hlit) + @as(u9, self.header.hdist) + 258;
-                self.litlen_tbl.data = self.data[0..codelen_count];
-                self.litlen_tbl.buildLitLen(&self.bit_reader);
-
-                // build literals/lenght table
-                self.litlen_tbl = .{
-                    .data = self.data[0 .. @as(u16, self.header.hlit) + 257],
-                };
-                self.litlen_tbl.buildHuffTable();
-
-                // build distances tables
-                self.dist_tbl = HTable{
-                    .data = self.data[@as(u16, self.header.hlit) + 257 ..][0 .. @as(u16, self.header.hdist) + 1],
-                };
-                self.dist_tbl.buildHuffTable();
-                try inflate(&self.bit_reader, &self.ring_writer, &self.litlen_tbl, &self.dist_tbl);
-                if (self.header.bfinal == 1)
+                if (header.bfinal == 1)
                     break;
             }
-            // write out the leftovers in the buffer
-            // TODO: this is a hack, formalize this
+            // write out the leftovers in the buffer TODO: this is a hack, formalize this
             if (self.ring_writer.cur > 1 << 15) {
                 _ = try self.ring_writer.writer.writer().write(self.ring_writer.buf[1 << 15 .. self.ring_writer.cur]);
             }
@@ -430,9 +420,6 @@ fn decompressor(reader: anytype, writer: anytype) Decompressor(BitReader(@TypeOf
     return .{
         .bit_reader = bitReader(reader),
         .ring_writer = rotateWriter(writer),
-        .header = undefined,
-        .litlen_tbl = undefined,
-        .dist_tbl = undefined,
     };
 }
 
