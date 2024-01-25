@@ -135,8 +135,7 @@ const BlockHeader = struct {
 /// A huffman table used for entropy decoding variable sequences of bits
 const HTable = struct {
     data: []Symlen,
-    minlen: u4 = MAXCODELEN - 1, // the minimum code word length
-    maxlen: u4 = 0, // the maximum code word length (1-15)
+    maxlen: u4 = MAXCODELEN - 1, // the maximum code word length (1-15)
     // the left-justified (lj) base table is basically all the code words for each symbol
     // but left-shifted so that they all have a bit-length of the maximum number of
     // code words.
@@ -154,20 +153,23 @@ const HTable = struct {
     /// The deflate format specifies that the run-length encoded symbols 0-18 are encoded by
     /// the number of code lengths from an array of ranges, build a huffman tree
     fn buildHuffTable(h: *HTable) void {
-        // codelength count table
-        var freq = [_]u16{0} ** MAXCODELEN;
+        // TODO:find a way to build the canonical codes so that they are in lsb order, not
+        // in the msb order; this is to improve performance so that I don't need peek_msb
+        // codelength freq table
+        var freq = [_]u16{0} ** (MAXCODELEN + 1);
         for (h.data) |item| {
             const len = item.length;
             freq[len] += 1;
-            h.maxlen = @max(len, h.maxlen);
-            h.minlen = if (len != 0) @min(len, h.minlen) else h.minlen;
         }
+
+        while (h.maxlen > 0 and freq[h.maxlen] == 0)
+            h.maxlen -= 1;
 
         // lj_base table
         {
             var code: u16 = 0;
             freq[0] = 0;
-            var i: u4 = h.minlen;
+            var i: u4 = 1;
             while (i <= h.maxlen) : (i += 1) {
                 code = (code + freq[i - 1]) << 1;
                 h.lj_base[i] = code << (h.maxlen - i);
@@ -183,7 +185,7 @@ const HTable = struct {
             var i: u4 = h.maxlen;
             // Look at the prefix for each left-justified code, since we need to record
             // the shortest length that matches that prefix.
-            while (i >= h.minlen) : (i -= 1) {
+            while (i >= 1) : (i -= 1) {
                 const base = h.lj_base[i] >> (h.maxlen - i); // get the base value of each length
                 const range = base + freq[i];
                 for (base..range) |b| {
@@ -219,33 +221,34 @@ const HTable = struct {
                 }
             }
         }
+
+        // TODO: build acceleration table, check libdeflate implementation
     }
 
     /// build the literals/length code table
-    fn buildLitLen(decodeTable: *HTable, br: anytype) void {
+    fn buildLitLen(self: *HTable, br: anytype) void {
         var i: usize = 0;
-        var lens = decodeTable.data;
-        while (i < lens.len) {
+        while (i < self.data.len) {
             br.refill();
-            const code: u16 = try decodeTable.lookup_decode(br);
+            const code: u16 = try self.lookup_decode(br);
             var rep: usize = 1;
-            lens[i].length = @truncate(code);
+            self.data[i].length = @truncate(code);
             if (code == 16) {
                 rep = br.getbits(2) + 3;
-                const prev = lens[i - 1].length;
-                for (lens[i..][0..rep]) |*val| {
+                const prev = self.data[i - 1].length;
+                for (self.data[i..][0..rep]) |*val| {
                     val.*.length = prev;
                 }
             }
             if (code == 17) {
                 rep = br.getbits(3) + 3;
-                for (lens[i..][0..rep]) |*val| {
+                for (self.data[i..][0..rep]) |*val| {
                     val.*.length = 0;
                 }
             }
             if (code == 18) {
                 rep = br.getbits(7) + 11;
-                for (lens[i..][0..rep]) |*val| {
+                for (self.data[i..][0..rep]) |*val| {
                     val.*.length = 0;
                 }
             }
