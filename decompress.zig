@@ -132,6 +132,11 @@ const BlockHeader = struct {
     }
 };
 
+const LenMap = packed struct {
+    offset: u16,
+    lj_base: u16,
+};
+
 /// A huffman table used for entropy decoding variable sequences of bits
 const HTable = struct {
     data: []Symlen,
@@ -139,9 +144,8 @@ const HTable = struct {
     // the left-justified (lj) base table is basically all the code words for each symbol
     // but left-shifted so that they all have a bit-length of the maximum number of
     // code words.
-    lj_base: [MAXCODELEN]u16 = [_]u16{0} ** MAXCODELEN,
+    lenmap: [MAXCODELEN]LenMap = undefined,
     prefix_start: [PREFIX_LEN]u16 = [_]u16{0} ** PREFIX_LEN,
-    offset: [MAXCODELEN]u16 = [_]u16{0} ** MAXCODELEN,
 
     const Self = @This();
     const prefix_size = PREFIX_SIZE;
@@ -166,16 +170,34 @@ const HTable = struct {
             h.maxlen -= 1;
 
         // lj_base table
+        var lj_base: [MAXCODELEN]u16 = undefined;
         {
             var code: u16 = 0;
             freq[0] = 0;
             var i: u4 = 1;
             while (i <= h.maxlen) : (i += 1) {
                 code = (code + freq[i - 1]) << 1;
-                h.lj_base[i] = code << (h.maxlen - i);
+                lj_base[i] = code << (h.maxlen - i);
             }
             // add sentinel value for absolute maximum code value
-            h.lj_base[h.maxlen + 1] = code << 1;
+            lj_base[h.maxlen + 1] = code << 1;
+        }
+
+        // offset table
+        var offset: [MAXCODELEN]u16 = undefined;
+        {
+            offset[0] = 0;
+            offset[1] = 0;
+            for (1..h.maxlen) |len| {
+                offset[len + 1] = offset[len] + freq[len];
+            }
+        }
+
+        // lenmapping
+        {
+            for (&h.lenmap, offset, lj_base) |*i, o, ljb| {
+                i.* = LenMap{ .offset = o, .lj_base = ljb };
+            }
         }
 
         // prefix_start table
@@ -186,7 +208,7 @@ const HTable = struct {
             // Look at the prefix for each left-justified code, since we need to record
             // the shortest length that matches that prefix.
             while (i >= 1) : (i -= 1) {
-                const base = h.lj_base[i] >> (h.maxlen - i); // get the base value of each length
+                const base = lj_base[i] >> (h.maxlen - i); // get the base value of each length
                 const range = base + freq[i];
                 for (base..range) |b| {
                     const lj = b << h.maxlen - i; // left justify the code
@@ -202,22 +224,14 @@ const HTable = struct {
             }
         }
 
-        // offset table
-        h.offset[1] = 0;
-        for (1..h.maxlen) |len| {
-            h.offset[len + 1] = h.offset[len] + freq[len];
-        }
-
         // populate the symbol index section of data
-        var offset_copy: [MAXCODELEN]u16 = undefined;
-        @memcpy(offset_copy[0..], h.offset[0..]);
         {
             var symbol: u9 = 0;
             while (symbol < h.data.len) : (symbol += 1) {
                 const len = h.data[symbol].length;
                 if (len != 0) {
-                    h.data[offset_copy[len]].symbol = symbol;
-                    offset_copy[len] += 1;
+                    h.data[offset[len]].symbol = symbol;
+                    offset[len] += 1;
                 }
             }
         }
@@ -264,12 +278,13 @@ const HTable = struct {
         const prefix = window >> (width - prefix_size);
         var length: u6 = @truncate(self.prefix_start[prefix]);
         if (length > prefix_size) {
-            while (window >= self.lj_base[length + 1])
+            while (window >= self.lenmap[length + 1].lj_base)
                 length += 1;
         }
         reader.consume(length);
         const rshift = width - length;
-        const symbol_id = self.offset[length] + ((window - self.lj_base[length]) >> rshift);
+        const lm = self.lenmap[length];
+        const symbol_id = lm.offset + (window - lm.lj_base >> rshift);
         return self.data[symbol_id].symbol;
     }
 };
