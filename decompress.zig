@@ -20,16 +20,16 @@ const MAXCODELEN = 16; // maximum number of bits in a huffman code;
 const PREFIX_SIZE = 3; // prefix length for code lookup TODO: write doc on this
 const PREFIX_LEN = 1 << PREFIX_SIZE;
 
-const MAXFASTLOOKUP = 9;
-const MAXFASTLOOKUPSIZE = 1 << MAXFASTLOOKUP;
+const MAXLOOKUP = 8;
+const MAXLOOKUPSIZE = 1 << MAXLOOKUP;
 
 // hard coded tables in the rfc
 // rfc 3.2.7 under (HCLEN + 4) in block format
 const CodeLengthLookup = [_]u5{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
 /// a data structure for packing in a code length and a symbol index
 const Symlen = packed struct {
-    symbol: u12,
-    length: u4,
+    symbol: u12 = 0,
+    length: u4 = 0,
 };
 
 const BlockHeader = struct {
@@ -73,7 +73,7 @@ const HTable = struct {
     // code words.
     lenmap: [MAXCODELEN]LenMap = undefined,
     prefix_start: [PREFIX_LEN]u16 = [_]u16{0} ** PREFIX_LEN,
-    fast_lookup: [MAXFASTLOOKUPSIZE]Symlen = undefined,
+    decode_table: [MAXLOOKUPSIZE]Symlen = undefined,
 
     const Self = @This();
     const prefix_size = PREFIX_SIZE;
@@ -88,7 +88,7 @@ const HTable = struct {
         // TODO:find a way to build the canonical codes so that they are in lsb order, not
         // in the msb order; this is to improve performance so that I don't need peek_msb
         // codelength freq table
-        var freq = [_]u16{0} ** (MAXCODELEN + 1);
+        var freq = [_]u12{0} ** (MAXCODELEN + 1);
         for (h.data) |item| {
             const len = item.length;
             freq[len] += 1;
@@ -97,74 +97,41 @@ const HTable = struct {
         while (h.maxlen > 0 and freq[h.maxlen] == 0)
             h.maxlen -= 1;
 
-        // lj_base table
-        var lj_base: [MAXCODELEN]u16 = undefined;
+        var next_code: [MAXCODELEN]u12 = [_]u12{0} ** MAXCODELEN;
         {
-            var code: u16 = 0;
+            var code: u12 = 0;
             freq[0] = 0;
             var i: u4 = 1;
             while (i <= h.maxlen) : (i += 1) {
                 code = (code + freq[i - 1]) << 1;
-                lj_base[i] = code << (h.maxlen - i);
-            }
-            // add sentinel value for absolute maximum code value
-            lj_base[h.maxlen + 1] = code << 1;
-        }
-
-        // offset table
-        var offset: [MAXCODELEN]u16 = undefined;
-        {
-            offset[0] = 0;
-            offset[1] = 0;
-            for (1..h.maxlen) |len| {
-                offset[len + 1] = offset[len] + freq[len];
+                next_code[i] = code;
             }
         }
 
-        // lenmapping
-        {
-            for (&h.lenmap, offset, lj_base) |*i, o, ljb| {
-                i.* = LenMap{ .offset = o, .lj_base = ljb };
-            }
-        }
+        std.debug.print("next_code: {d}\n", .{next_code});
 
-        // prefix_start table
+        // TODO: how do I manage a subtable
         {
-            const w = prefix_size; // width of prefix
-            const rshift: u4 = h.maxlen - w; // amt to shift to get prefix width
-            var i: u4 = h.maxlen;
-            // Look at the prefix for each left-justified code, since we need to record
-            // the shortest length that matches that prefix.
-            while (i >= 1) : (i -= 1) {
-                const base = lj_base[i] >> (h.maxlen - i); // get the base value of each length
-                const range = base + freq[i];
-                for (base..range) |b| {
-                    const lj = b << h.maxlen - i; // left justify the code
-                    const prefix = lj >> rshift; // keep the prefix
-                    h.prefix_start[prefix] = i;
+            for (h.data, 0..) |sl, i| {
+                const nbits = sl.length;
+                if (nbits > 0) {
+                    const code: u12 = next_code[nbits];
+                    next_code[nbits] += 1;
+                    {
+                        var n = nbits;
+                        var rev = @bitReverse(code) >> (12 - nbits); // symbol size of 12
+                        // fill top bits of reversed code
+                        while (rev < MAXLOOKUPSIZE) : (rev += @as(u12, 1) << n) {
+                            const symbol: u12 = @truncate(i); // usize -> u12
+                            h.decode_table[rev] = Symlen{ .symbol = symbol, .length = nbits };
+                        }
+                    }
                 }
             }
-            // second pass to fill in the gaps for prefix values that weren't populated
-            var j: usize = 1;
-            while (j < h.prefix_start.len) : (j += 1) {
-                if (h.prefix_start[j - 1] != 0 and h.prefix_start[j] == 0)
-                    h.prefix_start[j] = h.prefix_start[j - 1];
-            }
+            // for (0.., decode_table) |i, sl| {
+            //     std.debug.print("index: {d}, symbol: {d}, length: {d}\n", .{ i, sl.symbol, sl.length });
+            // }
         }
-
-        // populate the symbol index section of data
-        {
-            var symbol: u9 = 0;
-            while (symbol < h.data.len) : (symbol += 1) {
-                const len = h.data[symbol].length;
-                if (len != 0) {
-                    h.data[offset[len]].symbol = symbol;
-                    offset[len] += 1;
-                }
-            }
-        }
-
-        // TODO: build acceleration table, check libdeflate implementation
     }
 
     /// build the literals/length code table
@@ -172,7 +139,7 @@ const HTable = struct {
         var i: usize = 0;
         while (i < self.data.len) {
             br.refill();
-            const code: u16 = try self.lookup_decode(br);
+            const code: u16 = try self.decode(br);
             var rep: usize = 1;
             self.data[i].length = @truncate(code);
             if (code == 16) {
@@ -196,20 +163,20 @@ const HTable = struct {
             }
             i += rep;
         }
+        {
+            for (self.data) |d| {
+                std.debug.print("length:{d} \n", .{d.length});
+            }
+            if (true)
+                unreachable;
+        }
     }
 
-    fn accelerate_decode(self: *Self, reader: anytype) !u16 {
-        // TODO: currently peeking 15 bits, but maybe have that be in a
-        // constant somewhere
-        const peek = reader.peek_msb(MAXCODELEN);
-        const window = peek >> (MAXCODELEN - MAXFASTLOOKUP);
-        if (window < self.lj_base[MAXFASTLOOKUP + 1]) {
-            const sym = self.fast_lookup[window];
-            reader.consume(sym.length);
-            return sym.symbol;
-        } else {
-            return self.lookup_decode(reader);
-        }
+    fn decode(self: *Self, reader: anytype) !u16 {
+        const window = reader.peek_lsb(MAXLOOKUP);
+        const ret: Symlen = self.decode_table[window];
+        reader.consume(ret.length);
+        return ret.symbol;
     }
 
     /// One additional advantage is that I don't have to store the minimum code length.
