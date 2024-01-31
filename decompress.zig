@@ -6,6 +6,8 @@
 /// code length: the number of bits that make up a code word
 /// symbol: the encoded byte that a huffman code word maps to
 const std = @import("std");
+const BitReader = @import("bitreader.zig").BitReader;
+const bitReader = @import("bitreader.zig").bitReader;
 const mem = std.mem;
 const io = std.io;
 const assert = std.debug.assert;
@@ -21,84 +23,6 @@ const PREFIX_LEN = 1 << PREFIX_SIZE;
 // hard coded tables in the rfc
 // rfc 3.2.7 under (HCLEN + 4) in block format
 const CodeLengthLookup = [_]u5{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
-
-fn BitReader(comptime ReaderType: type) type {
-    return struct {
-        reader: ReaderType,
-        buf: [4096]u8 = undefined,
-        bitptr: usize = 0, // ptr to the stream
-        bitbuf: u64 = 0, // bit buffer
-        bitcount: u6 = 0, // number of bits in bitbuf
-
-        const Self = @This();
-
-        // initialize the buf and the bitbuf
-        fn initialize(self: *Self) !void {
-            _ = try self.reader.read(self.buf[0..]);
-            self.refill();
-        }
-
-        pub fn refill(self: *Self) void {
-            // grab the next word and insert them right above the current top
-            self.bitbuf |= self.read64() << self.bitcount;
-
-            // advance the ptr for next iteration
-            self.bitptr += (63 - self.bitcount) >> 3;
-
-            // update the bitcount
-            self.bitcount |= 56; // 0b111000; bitcount is in [56,63)
-        }
-
-        fn read64(self: *Self) u64 {
-            if (self.bitptr + 8 > self.buf.len) {
-                _ = self.lookahead();
-            }
-            return @bitCast(self.buf[self.bitptr..][0..8].*);
-        }
-
-        // read from stream into the buf
-        fn lookahead(self: *Self) usize {
-            const remaining = self.buf.len - self.bitptr;
-            @memcpy(self.buf[0..remaining], self.buf[self.bitptr..][0..remaining]);
-            // read into the top buffer
-            const left = self.reader.read(self.buf[remaining..]) catch @panic("read error");
-            self.bitptr = 0; // reset bitptr
-            return left;
-        }
-
-        fn peek_msb(self: *Self, n: u6) u64 {
-            assert(n > 0);
-
-            return @bitReverse(self.bitbuf << (63 - n + 1));
-        }
-
-        fn peek_lsb(self: *Self, count: u6) u64 {
-            assert(count >= 0 and count <= 56);
-            assert(count <= self.bitcount);
-
-            const mask: u64 = (@as(u64, 1) << count) - 1;
-            return self.bitbuf & mask;
-        }
-
-        fn consume(self: *Self, count: u6) void {
-            assert(count <= self.bitcount);
-
-            self.bitbuf >>= count;
-            self.bitcount -= count;
-        }
-
-        fn getbits(self: *Self, count: u6) u64 {
-            const bits = self.peek_lsb(count);
-            self.consume(count);
-            return bits;
-        }
-    };
-}
-
-fn bitReader(reader: anytype) BitReader(@TypeOf(reader)) {
-    return .{ .reader = reader };
-}
-
 /// a data structure for packing in a code length and a symbol index
 const Symlen = packed struct {
     symbol: u12,
