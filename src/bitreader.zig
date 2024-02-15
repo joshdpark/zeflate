@@ -53,12 +53,12 @@ pub fn BitReader(comptime ReaderType: type) type {
             return @bitReverse(self.bitbuf << (63 - n + 1));
         }
 
-        pub fn peek_lsb(self: *Self, count: u6) u64 {
+        pub fn peek_lsb(self: *Self, count: u6) u16 {
             assert(count >= 0 and count <= 56);
             assert(count <= self.bitcount);
 
             const mask: u64 = (@as(u64, 1) << count) - 1;
-            return self.bitbuf & mask;
+            return @intCast(self.bitbuf & mask);
         }
 
         pub fn consume(self: *Self, count: u6) void {

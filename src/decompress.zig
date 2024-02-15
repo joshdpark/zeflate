@@ -7,40 +7,20 @@ const BitReader = @import("bitreader.zig").BitReader;
 const bitReader = @import("bitreader.zig").bitReader;
 const mem = std.mem;
 const io = std.io;
+const testing = std.testing;
 const assert = std.debug.assert;
-const stdout = std.io.getStdOut();
 
-const MAXLITCODES = 286; // (257 - 286)
-const MAXDISTCODES = 30; // (1-32)
-const MAXCODES = MAXLITCODES + MAXDISTCODES;
-const MAXCODELEN = 15; // maximum number of bits in a huffman code;
-// taken from zlib
-const LITENSURE = 852;
-const DISTENSURE = 592;
-const LIT_BITS = 9;
-const DIST_BITS = 6;
-const PRECODE_BITS = 7;
-const ENSURE = LITENSURE + DISTENSURE;
+const htree = @import("htree.zig");
+const Entry = htree.Entry;
+
+const maxlitcodes = 286; // (257 - 286)
+const maxdistcodes = 30; // (1-32)
+const maxcodes = maxlitcodes + maxdistcodes;
+// const maxcodelen = 15; // maximum number of bits in a huffman code;
 
 // hard coded tables in the rfc
 // rfc 3.2.7 under (HCLEN + 4) in block format
-const CodeLengthLookup = [_]u5{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
-/// a data structure for packing in a code length and a symbol index
-const Entry = union(enum) {
-    entry: struct { // package contain symbol and length (sl)
-        length: u4 = 0,
-        symbol: u16 = 0,
-    },
-    sub: struct {
-        varbits: u4 = 0,
-        base: u16 = 0,
-    },
-};
-
-test Entry {
-    std.debug.print("sizeof entry: {d}\n", .{@sizeOf(Entry)});
-    std.debug.print("bitsizeof entry: {d}\n", .{@bitSizeOf(Entry)});
-}
+const precode_lookup = [_]u5{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
 
 const BlockHeader = struct {
     bfinal: u1,
@@ -74,183 +54,6 @@ const BlockHeader = struct {
             self.hdist + 1,
             self.hclen + 4,
         });
-    }
-};
-
-/// A huffman table used for entropy decoding variable sequences of bits
-const HTable = struct {
-    decode_table: []Entry = undefined,
-    table_bits: u4 = undefined,
-
-    const Self = @This();
-
-    fn decode(self: *Self, reader: anytype) Entry {
-        const window = reader.peek_lsb(self.table_bits);
-        var entry: Entry = self.decode_table[window];
-        while (true) {
-            switch (entry) {
-                .sub => |s| {
-                    reader.consume(self.table_bits);
-                    const offset = reader.peek_lsb(s.varbits);
-                    entry = self.decode_table[s.base + offset];
-                    assert(entry != .sub); // subtable entry can only link to main table
-                    continue;
-                },
-                .entry => |e| {
-                    assert(e.length != 0);
-                    reader.consume(e.length); // 15 bits
-                    return entry;
-                },
-            }
-        }
-    }
-
-    fn buildHuffTable(h: *HTable, lengths: []u4, decode_table: []Entry, comptime table_bits: u4) void {
-        h.table_bits = table_bits;
-
-        // declare arrays for holding intermediate tables
-        var freq = [_]u16{0} ** (MAXCODELEN + 1);
-        var offsets = [_]u16{0} ** (MAXCODELEN + 1);
-        var sorted_symbols = [_]u16{0} ** MAXCODES;
-
-        // counts of codeworld length
-        for (lengths) |len| {
-            freq[len] += 1;
-        }
-
-        var maxlen: u4 = MAXCODELEN; // the maximum code word length (1-15)
-        while (freq[maxlen] == 0)
-            maxlen -= 1;
-
-        offsets[0] = 0;
-        offsets[1] = freq[0];
-        for (1..maxlen) |len| {
-            offsets[len + 1] = offsets[len] + freq[len];
-        }
-
-        // symbols in lexigraphical order, first by symbol and then by codeword length
-        var symbol: u16 = 0;
-        while (symbol < lengths.len) : (symbol += 1) {
-            sorted_symbols[offsets[lengths[symbol]]] = symbol;
-            offsets[lengths[symbol]] += 1;
-        }
-
-        // for each symbol: length combination, write the table entry into the decode table.
-        var len: u4 = 1; // start at minimum codeworld length
-        while (freq[len] == 0)
-            len += 1;
-
-        var count: u16 = undefined;
-        var codeword: u16 = 0; // first codeword always starts at 0
-        var i: usize = offsets[0]; // sorted_symbol index, skip unusued symbols
-        const main_table: []Entry = decode_table[0 .. 1 << table_bits];
-        // iterate through each codeword length for the main table
-        while (len <= table_bits) : (len += 1) {
-            count = freq[len];
-            // for each count of codeword length, write an entry into the decode table
-            while (count > 0) : (count -= 1) {
-                var reverse: u16 = @bitReverse(codeword) >> @bitSizeOf(@TypeOf(codeword)) - 1 - len + 1;
-                const entry = .{ .entry = .{
-                    .symbol = sorted_symbols[i],
-                    .length = len,
-                } };
-                // fill out high bits in reversed code word
-                const stride: u16 = @as(u16, 1) << len;
-                while (true) {
-                    // assert(main_table[reverse].entry.length == 0);
-                    main_table[reverse] = entry;
-                    reverse += stride;
-                    if (reverse >= main_table.len)
-                        break;
-                }
-                codeword += 1;
-                i += 1;
-            }
-            codeword <<= 1;
-        }
-
-        // iterate through codewords that can't fit in the main table
-        var subtable_start: u16 = 1 << table_bits;
-        var subtable: []Entry = undefined;
-        const mask: u16 = (@as(u16, 1) << table_bits) - 1; // mask for subtable low bits
-        var prefix: u16 = std.math.maxInt(u16);
-        // get first code of subtable, including prefix and suffix bits
-        assert(len == table_bits + 1);
-        while (len <= maxlen) : (len += 1) {
-            count = freq[len];
-            // assert(freq[len] != 0);
-            while (count > 0) : (count -= 1) {
-                assert(len < MAXCODELEN);
-                var reverse: u16 = @bitReverse(codeword) >> @bitSizeOf(@TypeOf(codeword)) - 1 - len + 1;
-
-                // allot a subtable at the end of our previous table (main or another subtable)
-                if (reverse & mask != prefix) {
-                    prefix = reverse & mask;
-                    var slots_needed: u16 = count;
-                    var bit_space: u4 = len - table_bits;
-                    // count how many slots needed to hold all entries with the same prefix.
-                    while (slots_needed < @as(u16, 1) << bit_space) {
-                        bit_space += 1;
-                        slots_needed = (slots_needed << 1) + freq[bit_space + table_bits];
-                    }
-                    const subtable_end = subtable_start + (@as(u16, 1) << bit_space);
-                    subtable = decode_table[subtable_start..subtable_end];
-
-                    // place a link in the main table
-                    main_table[prefix] = .{ .sub = .{
-                        .base = subtable_start,
-                        .varbits = bit_space,
-                    } };
-                    subtable_start = subtable_end; // next subtable start index
-                }
-
-                reverse >>= table_bits; // get high bit suffix
-                const stride = @as(u16, 1) << (len - table_bits);
-                const entry: Entry = .{
-                    .entry = .{
-                        .symbol = sorted_symbols[i],
-                        .length = len - table_bits,
-                    },
-                };
-                while (true) {
-                    // assert(subtable[reverse].entry.length == 0);
-                    subtable[reverse] = entry;
-                    reverse += stride;
-                    if (reverse >= subtable.len)
-                        break;
-                }
-                codeword += 1;
-                i += 1;
-            }
-            codeword <<= 1;
-        }
-        h.decode_table = decode_table[0..subtable_start]; // set the decoder decode table
-    }
-
-    /// build the literals/length code table
-    fn buildLitLen(self: *HTable, lengths: []u4, br: anytype) void {
-        var i: usize = 0;
-        while (i < lengths.len) {
-            br.refill();
-            const codeword: Entry = self.decode(br);
-            const codelen: u16 = codeword.entry.symbol;
-            var rep: usize = 1;
-            if (codelen < 16)
-                lengths[i] = @as(u4, @intCast(codelen));
-            if (codelen == 16) {
-                rep = br.getbits(2) + 3;
-                @memset(lengths[i..][0..rep], lengths[i - 1]);
-            }
-            if (codelen == 17) {
-                rep = br.getbits(3) + 3;
-                @memset(lengths[i..][0..rep], 0);
-            }
-            if (codelen == 18) {
-                rep = br.getbits(7) + 11;
-                @memset(lengths[i..][0..rep], 0);
-            }
-            i += rep;
-        }
     }
 };
 
@@ -306,6 +109,10 @@ fn RotateWriter(comptime WriterType: type) type {
         fn writeout(self: *Self) !void {
             _ = try self.writer.write(self.buf[0..halflen]);
         }
+
+        fn flush(self: *Self) !void {
+            _ = try self.writer.write(self.buf[1 << 15 .. self.cur]);
+        }
     };
 }
 
@@ -313,7 +120,7 @@ fn rotateWriter(writer: anytype) RotateWriter(@TypeOf(writer)) {
     return .{ .writer = writer };
 }
 
-fn inflate(reader: anytype, ring: anytype, literals: *HTable, distances: *HTable) !void {
+fn inflate(reader: anytype, ring: anytype, literals: *htree.LiteralsTable, distances: *htree.DistancesTable) !void {
     // base lengths/distances and how many extra bits to consume and how
     // rfc 3.2.5
     const lenconsume = [29]u3{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
@@ -323,29 +130,22 @@ fn inflate(reader: anytype, ring: anytype, literals: *HTable, distances: *HTable
 
     while (true) {
         reader.refill();
-        var entry: Entry = literals.decode(reader);
-        var sym: u16 = switch (entry) {
-            .sub => |_| unreachable,
-            .entry => |e| e.symbol,
-        };
-        assert(sym <= 257 + 29 and sym != 0); // should never be above this number
-        if (sym < 256) {
-            ring.appendByte(@as(u8, @truncate(sym)));
-        } else if (sym == 256) { // end of block
-            break;
-        } else {
-            const lenid: usize = sym - 257;
-            const len_extra: u9 = @truncate(reader.getbits(lenconsume[lenid])); // up to 5 extra bits
-            const len = lenbase[lenid] + len_extra;
+        var entry: Entry = literals.decode(reader.peek_lsb(15));
+        reader.consume(entry.length);
+        switch (entry.kind) {
+            .link => unreachable,
+            .literal => ring.appendByte(@intCast(entry.symbol)),
+            .match => {
+                const len_extra: u9 = @truncate(reader.getbits(lenconsume[entry.symbol])); // up to 5 extra bits
+                const len = lenbase[entry.symbol] + len_extra;
 
-            entry = distances.decode(reader);
-            sym = switch (entry) {
-                .sub => |_| unreachable,
-                .entry => |e| e.symbol,
-            };
-            const dist_extra: usize = reader.getbits(distconsume[sym]); // up to 13 extra bits for 29 bits
-            const distance = distbase[sym] + dist_extra;
-            ring.appendSequence(distance, len);
+                entry = distances.decode(reader.peek_lsb(15));
+                reader.consume(entry.length);
+                const dist_extra: usize = reader.getbits(distconsume[entry.symbol]); // up to 13 extra bits for 29 bits
+                const distance = distbase[entry.symbol] + dist_extra;
+                ring.appendSequence(distance, len);
+            },
+            .end => break,
         }
         // swap out the front of the buffer into the back
         if (ring.cur >= ring.buf.len - 258) {
@@ -359,12 +159,13 @@ fn Decompressor(comptime ReaderType: type, comptime WriterType: type) type {
     return struct {
         bit_reader: ReaderType,
         ring_writer: WriterType,
-        lengths: [MAXCODES]u4 = [_]u4{0} ** MAXCODES,
-        decode_table: [ENSURE]Entry = [_]Entry{.{ .entry = .{ .symbol = 0, .length = 0 } }} ** ENSURE,
+        lengths: [maxcodes]u4 = [_]u4{0} ** maxcodes,
+        literals: htree.LiteralsTable = undefined,
+        distances: htree.DistancesTable = undefined,
 
         const Self = @This();
 
-        fn dynamicDecodeBlock(self: *Self, header: *const BlockHeader) !void {
+        fn dynamicBlock(self: *Self, header: *const BlockHeader) !void {
             // setup hlit and hdist lengths
             const hlit = header.hlit + 257;
             const hdist = header.hdist + 1;
@@ -373,107 +174,93 @@ fn Decompressor(comptime ReaderType: type, comptime WriterType: type) type {
             // populate codelen codelength table
             self.bit_reader.refill();
             for (0..hclen) |i| {
-                self.lengths[CodeLengthLookup[i]] = @truncate(self.bit_reader.getbits(3));
+                self.lengths[precode_lookup[i]] = @truncate(self.bit_reader.getbits(3));
             }
             // no need to keep precode htable
-            var precode = HTable{};
-            precode.buildHuffTable(
-                self.lengths[0..CodeLengthLookup.len],
-                self.decode_table[0..128],
-                PRECODE_BITS,
-            );
+            var precode = htree.PrecodeTable{};
+            precode.build(self.lengths[0..precode_lookup.len]);
             // resize data slice to hold literal/length codes
             const codelen_count = hlit + hdist;
-            precode.buildLitLen(self.lengths[0..codelen_count], &self.bit_reader);
+            self.inflatePrecode(&precode, codelen_count);
 
             // build literals/length table
-            var litlen = HTable{};
-            litlen.buildHuffTable(
-                self.lengths[0..hlit],
-                self.decode_table[0..LITENSURE],
-                LIT_BITS,
-            );
-
-            // build distances tables
-            var dist = HTable{};
-            dist.buildHuffTable(
-                self.lengths[hlit..][0..hdist],
-                self.decode_table[LITENSURE..][0..DISTENSURE],
-                DIST_BITS,
-            );
-            try inflate(&self.bit_reader, &self.ring_writer, &litlen, &dist);
+            self.literals.build(self.lengths[0..hlit]);
+            self.distances.build(self.lengths[hlit..][0..hdist]);
+            try inflate(&self.bit_reader, &self.ring_writer, &self.literals, &self.distances);
         }
 
-        fn decompress(self: *Self) !void {
+        fn inflatePrecode(self: *Self, precode: *htree.PrecodeTable, codelen_count: usize) void {
+            var i: usize = 0;
+            const lengths = self.lengths[0..codelen_count];
+            while (i < codelen_count) {
+                self.bit_reader.refill();
+                const entry = precode.decode(self.bit_reader.peek_lsb(7));
+                self.bit_reader.consume(entry.length);
+                switch (entry.symbol) {
+                    0...15 => {
+                        lengths[i] = @as(u4, @intCast(entry.symbol));
+                        i += 1;
+                    },
+                    16 => {
+                        const rep = self.bit_reader.getbits(2) + 3;
+                        @memset(lengths[i..][0..rep], lengths[i - 1]);
+                        i += rep;
+                    },
+                    17 => {
+                        const rep = self.bit_reader.getbits(3) + 3;
+                        @memset(lengths[i..][0..rep], 0);
+                        i += rep;
+                    },
+                    18 => {
+                        const rep = self.bit_reader.getbits(7) + 11;
+                        @memset(lengths[i..][0..rep], 0);
+                        i += rep;
+                    },
+                    else => unreachable,
+                }
+            }
+        }
+
+        pub fn decompress(self: *Self) !void {
             try self.bit_reader.initialize();
             while (true) {
                 const header = BlockHeader.init(&self.bit_reader);
-                // header.show();
                 switch (header.btype) {
                     0 => unreachable,
                     1 => unreachable,
-                    2 => try dynamicDecodeBlock(self, &header),
+                    2 => try dynamicBlock(self, &header),
                     3 => unreachable,
                 }
                 if (header.bfinal == 1)
                     break;
             }
             // write out the leftovers in the buffer TODO: this is a hack, formalize this
-            _ = try self.ring_writer.writer.writer().write(self.ring_writer.buf[1 << 15 .. self.ring_writer.cur]);
+            try self.ring_writer.flush();
         }
     };
 }
 
-fn decompressor(reader: anytype, writer: anytype) Decompressor(BitReader(@TypeOf(reader)), RotateWriter(@TypeOf(writer))) {
+pub fn decompressor(reader: anytype, writer: anytype) Decompressor(BitReader(@TypeOf(reader)), RotateWriter(@TypeOf(writer))) {
     return .{
         .bit_reader = bitReader(reader),
         .ring_writer = rotateWriter(writer),
     };
 }
 
-pub fn main() !void {
-    var sfa = std.heap.stackFallback(1024, std.heap.page_allocator);
-    const argsallocator = sfa.get();
-    const args = try std.process.argsAlloc(argsallocator);
-    defer std.process.argsFree(argsallocator, args);
-    const filename = args[1];
-    const fd = try std.fs.cwd().openFile(filename, .{});
-    defer fd.close();
+test Decompressor {
+    const parseGzip = @import("handle_gzip.zig").parseGzip;
+    const input: []const u8 = @embedFile("testdata/gunzip.c.gz");
+    const correct: []const u8 = @embedFile("testdata/gunzip.c");
+    var input_io = io.fixedBufferStream(input);
+    const stream = input_io.reader();
 
-    var breader = std.io.bufferedReader(fd.reader());
-    const stream = breader.reader();
-    const bstdout = std.io.bufferedWriter(stdout.writer());
+    var list = std.ArrayList(u8).init(std.testing.allocator);
+    defer list.deinit();
+    const output_io = list.writer();
 
-    // all of this is to just handle the gzip specification
-    {
-        // std.debug.print("gzip header bytes: \n", .{});
-        const filetype = try stream.readInt(u16, .little);
-        // std.debug.print("filetype: {x}\n", .{filetype});
-        if (filetype != 0x8b1f)
-            @panic("not a gzip");
-        const isdeflate = try stream.readByte();
-        if (isdeflate != 8)
-            @panic("not deflate compression");
-        const flags = try stream.readByte();
-        const name = (flags >> 3) & 1;
-        // std.debug.print("flags: {b:0>8}\n", .{flags});
-        _ = try stream.readInt(i32, .little);
-        // std.debug.print("mtime: {d}\n", .{mtime});
-        _ = try stream.readByte();
-        // std.debug.print("xfl: {d}\n", .{xfl});
-        _ = try stream.readByte();
-        // std.debug.print("os: {d}\n", .{os});
-        if (name > 0) {
-            // std.debug.print("\nfilename: ", .{});
-            while (stream.readByte()) |byte| {
-                if (byte == 0)
-                    break;
-                // std.debug.print("{c}", .{byte});
-            } else |_| {}
-            // std.debug.print("\n", .{});
-        }
-    }
-
-    var deflate_decoder = decompressor(stream, bstdout);
+    try parseGzip(stream);
+    var deflate_decoder = decompressor(stream, output_io);
     try deflate_decoder.decompress();
+    std.debug.print("{s}", .{list.items});
+    try testing.expectEqualSlices(u8, list.items, correct);
 }
