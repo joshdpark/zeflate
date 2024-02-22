@@ -51,16 +51,14 @@ const Stat = struct {
 /// This seems... like a hack? I don't know... I want to be able to pack information into
 /// as few bytes as possible (4 bytes for each literal/pointer); Is there anyway to get
 /// this as a tagged enum?
-const Segment = packed union {
-    literal: lit,
-    distlen: dl,
-
-    const lit = packed struct {
-        t: u8,
+const Segment = packed struct {
+    t: u8,
+    d: packed union {
         literal: u24,
-    };
+        distlen: dl,
+    },
+
     const dl = packed struct {
-        t: u8,
         length: u8,
         distance: u16,
     };
@@ -158,15 +156,13 @@ const LZParser = struct {
             const length = self.match(i, &offset);
             if (length != 0) {
                 if (literals_count > 0) {
-                    // std.debug.print("literal: {d}\n", .{literals_count});
-                    tape.append(.{ .literal = .{ .t = 'l', .literal = literals_count } });
+                    tape.append(.{ .t = 'l', .d = .{ .literal = literals_count } });
                     literals_count = 0;
                 }
                 const distance: u16 = @as(u16, @truncate(i)) - @as(u16, @intCast(offset));
-                tape.append(.{ .distlen = .{ .t = 'd', .distance = distance, .length = length } });
+                tape.append(.{ .t = 'd', .d = .{ .distlen = .{ .distance = distance, .length = length } } });
                 stat.distances[dist_to_code(distance)] += 1;
                 stat.lengths[length] += 1;
-                // std.debug.print("distance: {d}, length{d}\n", .{ distance, length });
                 i += length + 3;
             } else {
                 stat.literals[self.buf[i]] += 1;
@@ -200,10 +196,10 @@ test LZParser {
     try parser.tally(&stat, &tape);
     for (0..20) |i| {
         const seg = tape.buf[i];
-        if (seg.literal.t == 'l') {
-            std.debug.print("literal: {d}\n", .{seg.literal.literal});
+        if (seg.t == 'l') {
+            std.debug.print("literal: {d}\n", .{seg.d.literal});
         } else {
-            std.debug.print("distance: {d}, length: {d}\n", .{ seg.distlen.distance, seg.distlen.length });
+            std.debug.print("distance: {d}, length: {d}\n", .{ seg.d.distlen.distance, seg.d.distlen.length });
         }
     }
     std.debug.print("freq: {any}\n", .{stat});

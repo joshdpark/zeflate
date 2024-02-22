@@ -225,7 +225,6 @@ fn Decompressor(comptime ReaderType: type, comptime WriterType: type) type {
                 if (header.bfinal == 1)
                     break;
             }
-            // write out the leftovers in the buffer TODO: this is a hack, formalize this
             try self.ring_writer.flush();
         }
     };
