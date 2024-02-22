@@ -80,27 +80,19 @@ pub fn HuffmanTable(
             var count: u16 = freq[entries[nonzero].length];
             // for keeping track of the subtable
             var prefix: u16 = std.math.maxInt(u16);
-            var len: u4 = entries[nonzero].length;
-            // TODO: can I remove this len?
             var subtable_start: u16 = 1 << lookup_bits;
             var subtable: []Entry = undefined;
 
             // populate the lookup table and links in symbol table
             for (entries[nonzero..], codewords[nonzero..]) |*entry, *code| {
                 assert(entry.length != 0);
-                // sometimes, codeword lengths can have gaps, this needs to be handled
-                // gracefully
-                while (count == 0) {
-                    codeword <<= 1;
-                    len += 1;
-                    count = freq[len];
-                }
                 // advance the codeword
-                defer codeword += 1;
+                if (count == 0) count = freq[entry.length];
+                defer codeword += @as(u16, 1) << 15 - entry.length;
                 defer count -= 1;
 
                 // reverse the codeword and add to lookup table
-                var reversed: u16 = reverseCodeword(codeword, entry.length);
+                var reversed: u16 = @bitReverse(codeword) >> 1;
                 code.* = reversed;
                 if (entry.length <= lookup_bits) {
                     while (true) {
