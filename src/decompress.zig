@@ -111,13 +111,36 @@ fn RotateWriter(comptime WriterType: type) type {
         }
 
         fn flush(self: *Self) !void {
-            _ = try self.writer.write(self.buf[1 << 15 .. self.cur]);
+            _ = try self.writer.write(self.buf[halflen..self.cur]);
         }
     };
 }
 
 fn rotateWriter(writer: anytype) RotateWriter(@TypeOf(writer)) {
     return .{ .writer = writer };
+}
+
+fn inflatePrecode(r: anytype, precode: *htree.PrecodeTable, lengths: []u4) void {
+    var i: usize = 0;
+    while (i < lengths.len) {
+        r.refill();
+        const entry = precode.decode(r.peek_lsb(7));
+        r.consume(entry.length);
+        var rep: usize = 1;
+        if (entry.symbol < 16) {
+            lengths[i] = @as(u4, @intCast(entry.symbol));
+        } else if (entry.symbol == 16) {
+            rep = r.getbits(2) + 3;
+            @memset(lengths[i..][0..rep], lengths[i - 1]);
+        } else if (entry.symbol == 17) {
+            rep = r.getbits(3) + 3;
+            @memset(lengths[i..][0..rep], 0);
+        } else if (entry.symbol == 18) {
+            rep = r.getbits(7) + 11;
+            @memset(lengths[i..][0..rep], 0);
+        } else unreachable;
+        i += rep;
+    }
 }
 
 fn inflate(reader: anytype, ring: anytype, literals: *htree.LiteralsTable, distances: *htree.DistancesTable) !void {
@@ -181,44 +204,12 @@ fn Decompressor(comptime ReaderType: type, comptime WriterType: type) type {
             precode.build(self.lengths[0..precode_lookup.len]);
             // resize data slice to hold literal/length codes
             const codelen_count = hlit + hdist;
-            self.inflatePrecode(&precode, codelen_count);
+            inflatePrecode(&self.bit_reader, &precode, self.lengths[0..codelen_count]);
 
             // build literals/length table
             self.literals.build(self.lengths[0..hlit]);
             self.distances.build(self.lengths[hlit..][0..hdist]);
             try inflate(&self.bit_reader, &self.ring_writer, &self.literals, &self.distances);
-        }
-
-        fn inflatePrecode(self: *Self, precode: *htree.PrecodeTable, codelen_count: usize) void {
-            var i: usize = 0;
-            const lengths = self.lengths[0..codelen_count];
-            while (i < codelen_count) {
-                self.bit_reader.refill();
-                const entry = precode.decode(self.bit_reader.peek_lsb(7));
-                self.bit_reader.consume(entry.length);
-                switch (entry.symbol) {
-                    0...15 => {
-                        lengths[i] = @as(u4, @intCast(entry.symbol));
-                        i += 1;
-                    },
-                    16 => {
-                        const rep = self.bit_reader.getbits(2) + 3;
-                        @memset(lengths[i..][0..rep], lengths[i - 1]);
-                        i += rep;
-                    },
-                    17 => {
-                        const rep = self.bit_reader.getbits(3) + 3;
-                        @memset(lengths[i..][0..rep], 0);
-                        i += rep;
-                    },
-                    18 => {
-                        const rep = self.bit_reader.getbits(7) + 11;
-                        @memset(lengths[i..][0..rep], 0);
-                        i += rep;
-                    },
-                    else => unreachable,
-                }
-            }
         }
 
         pub fn decompress(self: *Self) !void {
@@ -261,6 +252,5 @@ test Decompressor {
     try parseGzip(stream);
     var deflate_decoder = decompressor(stream, output_io);
     try deflate_decoder.decompress();
-    std.debug.print("{s}", .{list.items});
     try testing.expectEqualSlices(u8, list.items, correct);
 }

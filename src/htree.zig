@@ -42,20 +42,16 @@ pub fn HuffmanTable(
 
             // symbols can be byte values representing literals 0-255
             // end of block or a length for literals/length huffman trees or distances
-            var freq: [max_possible_codelen + 1]u16 = [_]u16{0} ** (max_possible_codelen + 1); // count of each codeword length
-            var offsets: [max_possible_codelen + 1]u16 = [_]u16{0} ** (max_possible_codelen + 1);
+            var freq = [_]u16{0} ** (max_possible_codelen + 1); // count of each codeword length
+            var offsets = [_]u16{0} ** (max_possible_codelen + 1);
             const entries = self.entries[0..lengths.len];
             const codewords = self.codewords[0..lengths.len];
 
             for (lengths) |len| {
-                assert(len <= max_possible_codelen);
                 freq[len] += 1;
             }
-            const max: u4 = blk: {
-                var m: u4 = max_possible_codelen;
-                while (freq[m] == 0) m -= 1;
-                break :blk m;
-            };
+            var max: u4 = max_possible_codelen;
+            while (freq[max] == 0) max -= 1;
 
             var codespace_used: u16 = 0;
             offsets[0] = 0;
@@ -84,15 +80,20 @@ pub fn HuffmanTable(
             var count: u16 = freq[entries[nonzero].length];
             // for keeping track of the subtable
             var prefix: u16 = std.math.maxInt(u16);
+            var len: u4 = entries[nonzero].length;
+            // TODO: can I remove this len?
             var subtable_start: u16 = 1 << lookup_bits;
             var subtable: []Entry = undefined;
 
             // populate the lookup table and links in symbol table
             for (entries[nonzero..], codewords[nonzero..]) |*entry, *code| {
-                if (entry.length == 0) continue;
-                if (count == 0) {
+                assert(entry.length != 0);
+                // sometimes, codeword lengths can have gaps, this needs to be handled
+                // gracefully
+                while (count == 0) {
                     codeword <<= 1;
-                    count = freq[entry.length];
+                    len += 1;
+                    count = freq[len];
                 }
                 // advance the codeword
                 defer codeword += 1;
@@ -126,7 +127,7 @@ pub fn HuffmanTable(
                         const space: u16 = @as(u16, 1) << space_bits;
                         subtable = self.lookup[subtable_start..][0..space];
                         // set Entry in main lookup region to hold a link
-                        self.lookup[reversed & mask] = Entry{
+                        self.lookup[prefix] = Entry{
                             .kind = .link,
                             .length = space_bits, // extra bits to read from stream
                             .symbol = subtable_start, // index to subtable
