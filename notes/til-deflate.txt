@@ -1,0 +1,41 @@
+Today I learned
+
+While working on the decompressor for deflate in zig I felt like I made a couple of
+breakthroughs in understanding certain concepts. One of the challenges in this has been
+trying to figure out a way to run the decompressor without allocation. This has led me
+down a number of different paths in my research and I basically came across a couple of
+sources that really helped me out.
+
+The first is the ryg blog which demonstrates a way to read a bitstream in a way that
+incorporates lookahead and out-of-order execution to better take advantage of the
+pipelining in arm/x86 processors.
+
+The second is a paper by Alistair Moffat and Andrew Turpin: "On the implementation of
+Minimum Redunandancy Prefix Codes". I found this paper from a blog post by cbloom at
+'http://cbloomrants.blogspot.com/2010/08/08-12-10-lost-huffman-paper.html'. This paper
+basically outlines how one can implement a huffman encoder and decoder using techniques
+that eliminates heap allocations, keep data usage below L1 cache levels, and even allow
+for instruction level parallelism by decoupling several key data dependencies within the
+pipeline.
+
+There's also another paper by Moffat: "In-place calculation of minimum-redundancy codes."
+that I plan on reading in order to implement the creation of the encoder.
+
+--
+TODO: rethink/rewrite this paragraph. It's not concrete and it shows that I need to do
+more learning in this area.
+--
+I think one of the greatest things about trying to implement deflate decompressor is that
+table indirection can go a long way. A computer can encode a truly staggering number of
+possible states, and in general, a lot of computation and memory is utilized because it's
+hard to think in table indirection. It's easier to think in hash tables, where there are
+unique keys that pair with a value than it is to think about 3 or more tables that are all
+offsetting into other tables. The advantage of the intermediate tables is that it uses
+much less memory and computation. No need to calculate the hash of a value and no need to
+allocate a bunch of memory in the heap. However, this is only really for cases where the
+specification is exact and where you won't need to make dynamic changes to data.
+
+Another thing that I learned is that there is a lot of space for reusing arrays that are
+allocated. Even when an array is allocated on the stack, if in a process it can be reused,
+then that keeps the data in cache and saves on having to make large stack allocations
+because small is fast.
