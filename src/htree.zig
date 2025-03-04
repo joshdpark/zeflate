@@ -1,7 +1,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const max_possible_codewords = 255 + 1 + 29 + 30; // 255 literals, 1 end of block, 29 lengths and 30 distances
+// 255 literals, 1 end of block, 29 lengths and 30 distances
+const max_possible_codewords = 255 + 1 + 29 + 30;
 pub const Entry = struct {
     kind: Kind = .end,
     length: u4 = 0,
@@ -47,12 +48,15 @@ pub fn HuffmanTable(
             const entries = self.entries[0..lengths.len];
             const codewords = self.codewords[0..lengths.len];
 
+            // DEFLATE 3.2.2
+            // 1. count the number of codes for each codelength
             for (lengths) |len| {
                 freq[len] += 1;
             }
             var max: u4 = max_possible_codelen;
             while (freq[max] == 0) max -= 1;
 
+            // 2. find the numerical value of the smallest code for each codelength
             var codespace_used: u16 = 0;
             offsets[0] = 0;
             offsets[1] = freq[0];
@@ -62,8 +66,7 @@ pub fn HuffmanTable(
             }
             codespace_used = (codespace_used << 1) + freq[max];
 
-            // TODO: add logic for handling incomplete codes
-
+            // 3. assign numerical value to all codes
             for (lengths, 0..) |len, symbol| {
                 entries[offsets[lengths[symbol]]] = switch (symbol) {
                     0...255 => Entry{ .kind = .literal, .length = len, .symbol = @intCast(symbol) },
