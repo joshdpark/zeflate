@@ -2,57 +2,80 @@ const std = @import("std");
 
 const maxcodelen = 15; // deflate specifies that codelens cannot be longer than 15 bits
 
-fn htree(comptime alphabet_size: usize) type {
+fn htree(comptime alphabet_size: usize, comptime max_codelen: u4, comptime lookup_bits: u3) type {
     return struct {
-        freq: [maxcodelen]u32 = [_]u32{0} ** maxcodelen,
-        next_code: [maxcodelen]u32 = [_]u32{0} ** maxcodelen,
-        code_table: [alphabet_size]LenSymbol = undefined,
+        freq: [max_codelen + 1]u12 = [_]u12{0} ** (max_codelen + 1),
+        next_code: [max_codelen + 1]u12 = undefined,
+        symbol: [alphabet_size]Codeword = undefined,
+        lookup: [(1 << lookup_bits) - 1]Codeword = undefined,
 
-        const LenSymbol = packed struct { length: u8, codeword: u24 };
+        const Codeword = packed struct {
+            code: u12,
+            len: u4,
+            symbol: u8,
+            next: u8,
+        };
 
-        /// codelengths is a table that is symbol->codelength
-        fn build(self: *@This(), codelengths: []const u32) void {
-            // build freq table
-            for (codelengths) |l|
-                self.freq[l] += 1;
-
-            // what's the maximum codelength?
-            var maxlen: u32 = maxcodelen - 1;
-            while (self.freq[maxlen] == 0)
-                maxlen -= 1;
-
-            // build next_code offset table
-            var code: u32 = 0;
-            self.freq[0] = 0;
-            for (1..maxlen + 1) |len| {
-                code = (code + self.freq[len - 1]) << 1;
-                self.next_code[len] = code;
+        fn build(self: *@This(), codelens: []const u8) void {
+            for (codelens) |len| self.freq[len] += 1;
+            var max: u4 = self.freq.len - 1;
+            while (self.freq[max] == 0) max -= 1;
+            self.next_code[0] = 0;
+            var code: u12 = 0;
+            var i: usize = 1;
+            while (i <= max) : (i += 1) {
+                code = (code + self.freq[i - 1]) << 1;
+                self.next_code[i] = code;
             }
 
-            // build code table
-            for (&self.code_table, codelengths) |*symbol, l| {
-                if (l == 0)
+            var symbol: u8 = @as(u8, @intCast(codelens.len)) - 1;
+            var links = [_]u8{0} ** (max_codelen + 1);
+            while (true) : (symbol -= 1) {
+                const len = codelens[symbol];
+                const link: u8 = links[len];
+                links[len] = symbol;
+                code = self.next_code[len] + self.freq[len] - 1;
+                self.freq[len] -= 1;
+                self.symbol[symbol] = .{
+                    .symbol = @intCast(symbol),
+                    .code = code,
+                    .len = @intCast(len),
+                    .next = link,
+                };
+                if (symbol == 0) break;
+            }
+
+            for (self.symbol) |codeword| {
+                if (codeword.len == 0) continue;
+                code = codeword.code;
+                var reverse: u12 = @bitReverse(code) >> (@bitSizeOf(@TypeOf(code)) - codeword.len);
+                if (reverse > self.lookup.len) {
+                    reverse &= @as(u12, @intCast(self.lookup.len)) - 1;
+                    self.lookup[reverse] = .{ .code = 0, .symbol = 0, .len = codeword.len, .next = links[codeword.len] };
                     continue;
-                const codeword = self.next_code[l];
-                self.next_code[l] += 1;
-                const length = l;
-                const pair: LenSymbol = .{ .length = @truncate(length), .codeword = @truncate(codeword) };
-                symbol.* = pair;
+                }
+                const stride: u12 = @as(u12, 1) << codeword.len;
+                while (reverse < self.lookup.len) : (reverse += stride)
+                    self.lookup[reverse] = codeword;
             }
         }
     };
 }
 
 test htree {
-    const Htree = htree(8);
+    const Htree = htree(8, 4, 3);
     // alphabet: A, B, C, D, E, F, G
-    const codelengths = [_]u32{ 3, 3, 3, 3, 3, 2, 4, 4 };
+    const codelengths = [_]u8{ 3, 3, 3, 3, 3, 2, 4, 4 };
     var decoder: Htree = .{};
     decoder.build(&codelengths);
-    try std.testing.expectEqualSlices(u32, &decoder.freq, &.{ 0, 0, 1, 5, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
-    // try std.testing.expectEqualSlices(u32, &decoder.next_code, &.{ 0, 0, 0, 2, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
-    for (decoder.code_table) |lensym| {
-        std.debug.print("length: {d}, codeword: {d}\n", .{ lensym.length, lensym.codeword });
+    // try std.testing.expectEqualSlices(u12, &.{ 0, 0, 1, 5, 2 }, &decoder.freq);
+    try std.testing.expectEqualSlices(u12, &decoder.next_code, &.{ 0, 0, 0, 2, 14 });
+    // try std.testing.expectEqualSlices(u12, &decoder.next_code, &.{ 0, 0, 1, 7, 16 });
+    for (decoder.symbol) |codeword| {
+        std.debug.print("code: {d}, len: {d}, symbol: {d}, next: {d}\n", .{ codeword.code, codeword.len, codeword.symbol, codeword.next });
+    }
+    for (decoder.lookup) |codeword| {
+        std.debug.print("code: {d}, len: {d}, symbol: {d}, next: {d}\n", .{ codeword.code, codeword.len, codeword.symbol, codeword.next });
     }
     // try std.testing.expectEqualSlices(u32, &decoder.next_code, &.{});
 }
