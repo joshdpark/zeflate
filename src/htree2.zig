@@ -101,6 +101,21 @@ fn htree(comptime alphabet_size: usize, comptime max_codelen: u4, comptime looku
     };
 }
 
+fn incr_left_lsb(bits: u5, j: u32) u32 {
+    // find first zero position
+    const inverse = ~j & ((@as(u32, 1) << bits) - 1);
+    const pos: u5 = @intCast(32 - 1 - @clz(inverse));
+    // set first zero to 1, set all values left of that to 0
+    const mask = (@as(u32, 1) << pos) - 1;
+    return (j & mask) | (@as(u32, 1) << pos);
+}
+
+test incr_left_lsb {
+    try std.testing.expectEqual(0b111, incr_left_lsb(3, 0b011));
+    try std.testing.expectEqual(0b0111, incr_left_lsb(4, 0b1011));
+    try std.testing.expectEqual(0b1001, incr_left_lsb(4, 0b0001));
+}
+
 const std = @import("std");
 const Htree = htree(8, 4, 3);
 
