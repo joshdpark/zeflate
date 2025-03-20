@@ -1,5 +1,3 @@
-const std = @import("std");
-
 fn htree(comptime alphabet_size: usize, comptime max_codelen: u4, comptime lookup_size: u4) type {
     return struct {
         bitbuffer: u64 = 0,
@@ -87,24 +85,26 @@ fn htree(comptime alphabet_size: usize, comptime max_codelen: u4, comptime looku
                 h.bitbuffer >>= entry.len; // consume code
                 return entry.payload.symbol;
             }
-            var codeword: Codeword = h.symbol[@intFromEnum(entry.payload.next)];
-            while (true) {
+            var next: Index = entry.payload.next;
+            var codeword: Codeword = undefined;
+            while (next != .nil) : (next = codeword.next) {
+                codeword = h.symbol[@intFromEnum(next)];
                 const mask = (@as(Symbol, 1) << codeword.len) - 1;
-                std.debug.print("entry.payload: {d}, codeword: {any}, bitbuffer:{b}, mask: {d} \n", .{ entry.payload.next, codeword, h.bitbuffer, mask });
                 if ((h.bitbuffer & mask) == codeword.code) {
                     h.bitbuffer >>= codeword.len; // consume code
                     return codeword.symbol;
                 }
-                // hitting nil should just lead to a buffer overflow and therefore unreachable
-                if (codeword.next == .nil) unreachable;
-                codeword = h.symbol[@intFromEnum(codeword.next)];
             }
+            // hitting nil should just lead to a buffer overflow and therefore unreachable
+            unreachable;
         }
     };
 }
 
-test htree {
-    const Htree = htree(8, 4, 3);
+const std = @import("std");
+const Htree = htree(8, 4, 3);
+
+test Htree {
     // alphabet: A, B, C, D, E, F, G
     const codelengths = [_]u4{ 3, 3, 3, 3, 3, 2, 4, 4 };
     var decoder: Htree = .{};
