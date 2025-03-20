@@ -63,6 +63,7 @@ fn htree(comptime alphabet_size: usize, comptime max_codelen: u4, comptime looku
                 while (true) : (i -= 1) {
                     const codeword = &h.symbol[i];
                     var reverse = @bitReverse(codeword.code) >> @bitSizeOf(Code) - codeword.len;
+                    codeword.code = reverse;
                     if (codeword.len > lookup_size) {
                         reverse &= (1 << lookup_size) - 1;
                         const tmp = h.lookup[reverse].payload.next;
@@ -79,7 +80,7 @@ fn htree(comptime alphabet_size: usize, comptime max_codelen: u4, comptime looku
             }
         }
 
-        fn decode(h: *@This()) Symbol {
+        fn query(h: *@This()) Symbol {
             const prefix = h.bitbuffer & ((1 << lookup_size) - 1);
             const entry = h.lookup[prefix];
             if (entry.len > 0) {
@@ -89,13 +90,14 @@ fn htree(comptime alphabet_size: usize, comptime max_codelen: u4, comptime looku
             var codeword: Codeword = h.symbol[@intFromEnum(entry.payload.next)];
             while (true) {
                 const mask = (@as(Symbol, 1) << codeword.len) - 1;
-                if ((h.bitbuffer & mask) ^ codeword.code == 0) {
+                std.debug.print("entry.payload: {d}, codeword: {any}, bitbuffer:{b}, mask: {d} \n", .{ entry.payload.next, codeword, h.bitbuffer, mask });
+                if ((h.bitbuffer & mask) == codeword.code) {
                     h.bitbuffer >>= codeword.len; // consume code
                     return codeword.symbol;
                 }
+                // hitting nil should just lead to a buffer overflow and therefore unreachable
+                if (codeword.next == .nil) unreachable;
                 codeword = h.symbol[@intFromEnum(codeword.next)];
-                // hitting nil should just lead to a buffer overflow and
-                // therefore an error
             }
         }
     };
@@ -108,15 +110,16 @@ test htree {
     var decoder: Htree = .{};
     decoder.build(codelengths);
     // symbol table tests
+    // the codes are in fact reversed
     try std.testing.expectEqualSlices(Htree.Codeword, &.{
-        .{ .len = 2, .code = 0, .symbol = 5, .next = .nil },
-        .{ .len = 3, .code = 2, .symbol = 0, .next = .nil },
-        .{ .len = 3, .code = 3, .symbol = 1, .next = .nil },
-        .{ .len = 3, .code = 4, .symbol = 2, .next = .nil },
-        .{ .len = 3, .code = 5, .symbol = 3, .next = .nil },
-        .{ .len = 3, .code = 6, .symbol = 4, .next = .nil },
-        .{ .len = 4, .code = 14, .symbol = 6, .next = @enumFromInt(7) },
-        .{ .len = 4, .code = 15, .symbol = 7, .next = .nil },
+        .{ .len = 2, .code = 0, .symbol = 5, .next = .nil }, // 00 -> 00
+        .{ .len = 3, .code = 2, .symbol = 0, .next = .nil }, // 010 -> 010
+        .{ .len = 3, .code = 6, .symbol = 1, .next = .nil }, // 011 -> 110
+        .{ .len = 3, .code = 1, .symbol = 2, .next = .nil }, // 100 -> 001
+        .{ .len = 3, .code = 5, .symbol = 3, .next = .nil }, // 101 -> 101
+        .{ .len = 3, .code = 3, .symbol = 4, .next = .nil }, // 110 -> 011
+        .{ .len = 4, .code = 7, .symbol = 6, .next = @enumFromInt(7) }, // 1110 -> 0111
+        .{ .len = 4, .code = 15, .symbol = 7, .next = .nil }, // 1111 -> 1111
     }, &decoder.symbol);
 
     try std.testing.expectEqualSlices(Htree.Entry, &.{
@@ -131,10 +134,10 @@ test htree {
     }, &decoder.lookup);
 
     decoder.bitbuffer = 0b01110101111;
-    try std.testing.expectEqual(7, decoder.decode());
+    try std.testing.expectEqual(7, decoder.query());
     try std.testing.expectEqual(0b0111010, decoder.bitbuffer);
-    try std.testing.expectEqual(2, decoder.decode());
+    try std.testing.expectEqual(0, decoder.query());
     try std.testing.expectEqual(0b0111, decoder.bitbuffer);
-    try std.testing.expectEqual(6, decoder.decode());
+    try std.testing.expectEqual(6, decoder.query());
     try std.testing.expect(1 == 0);
 }
