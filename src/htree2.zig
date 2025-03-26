@@ -1,119 +1,102 @@
 fn htree(comptime alphabet_size: usize, comptime max_codelen: u4, comptime lookup_size: u4) type {
     return struct {
         bitbuffer: u64 = 0,
-        symbol: [alphabet_size]Codeword = undefined,
-        lookup: [1 << lookup_size]Entry = @splat(.{ .len = 0, .payload = .{ .next = .nil } }),
+        codeword: [alphabet_size]Codeword = undefined,
+        lookup: [1 << lookup_size]Entry = @splat(.{ .payload = .{ .next = .nil }, .len = 0 }),
 
+        const Symbol = u16;
         const Code = u15;
-        const Symbol = u12;
+        const CodewordIndex = enum(u16) { nil = std.math.maxInt(u16), _ };
 
-        const Index = enum(u12) {
-            nil = std.math.maxInt(u12),
-            _,
+        const Codeword = packed struct {
+            symbol: Symbol,
+            len: u4,
+            code: Code,
+            next: CodewordIndex,
         };
 
         const Entry = packed struct {
-            len: u4,
             payload: packed union {
                 symbol: Symbol,
-                next: Index,
+                next: CodewordIndex,
             },
-        };
-
-        const Codeword = packed struct {
-            code: Code, // 15 bits
             len: u4,
-            symbol: Symbol,
-            next: Index, // 12 bits
         };
 
-        pub fn build(h: *@This(), codelengths: [alphabet_size]u4) void {
-            var freq: [max_codelen + 1]u12 = @splat(0);
-            var next_code: [max_codelen + 1]Code = undefined;
-            for (codelengths) |len| freq[len] += 1;
-            var max = freq.len - 1; // the max codelength in this corpus
+        fn build(ht: *@This(), codelengths: []const u4) void {
+            var freq: [max_codelen + 1]u32 = @splat(0);
+            for (codelengths) |code| freq[code] += 1;
+            var max = freq.len - 1;
             while (freq[max] == 0) max -= 1;
-
-            next_code[0] = 0;
-            var code: Code = 0;
-            for (freq[0..max], next_code[1..][0..max]) |p, *n_code| {
-                code = (code + p) << 1;
-                n_code.* = code;
-            }
-
-            var offset: [max_codelen + 1]u12 = undefined;
+            // get offsets into the symbols table for sorting codewords
+            var offset: [max_codelen + 1]u32 = undefined;
             offset[0] = 0;
-            for (offset[0..][0..max], offset[1..][0..max], freq[0..][0..max]) |loff, *roff, f|
-                roff.* = loff + f;
-
-            // create sorted symbol table
-            for (codelengths, 0..) |len, i| {
+            for (offset[1..][0..max], offset[0..max], freq[0..max]) |*off, prev, f|
+                off.* = prev + f;
+            // sort the symbols
+            for (0.., codelengths) |i, len| {
                 const symbol: Symbol = @intCast(i);
-                code = next_code[len];
-                next_code[len] += 1;
-                h.symbol[offset[len]] = .{ .code = code, .len = len, .symbol = symbol, .next = .nil };
+                const codeword: Codeword = .{
+                    .symbol = symbol,
+                    .len = len,
+                    .code = undefined,
+                    .next = .nil,
+                };
+                ht.codeword[offset[len]] = codeword;
                 offset[len] += 1;
             }
-
-            // create lookup table
-            {
-                var i: Symbol = @intCast(h.lookup.len - 1);
-                while (true) : (i -= 1) {
-                    const codeword = &h.symbol[i];
-                    var reverse = @bitReverse(codeword.code) >> @bitSizeOf(Code) - codeword.len;
-                    codeword.code = reverse;
-                    if (codeword.len > lookup_size) {
-                        reverse &= (1 << lookup_size) - 1;
-                        const tmp = h.lookup[reverse].payload.next;
-                        h.lookup[reverse].payload.next = @enumFromInt(i);
-                        h.symbol[i].next = tmp;
-                        continue;
-                    }
-                    const stride = @as(u12, 1) << codeword.len;
-                    while (reverse < h.lookup.len) : (reverse += stride) {
-                        h.lookup[reverse] = .{ .len = codeword.len, .payload = .{ .symbol = codeword.symbol } };
-                    }
-                    if (i == 0) break;
+            // create the code words, code lsb is on left.
+            var code: Code = 0;
+            for (ht.codeword[0 .. ht.codeword.len - 1]) |*codeword| {
+                codeword.code = code;
+                const bsize = @bitSizeOf(Code); // backing size of Code
+                const inverse = ~code & ((@as(Code, 1) << codeword.len) - 1);
+                const pos = bsize - 1 - @clz(inverse);
+                const msz = @as(Code, 1) << pos;
+                // flip the most significant 0 bit and clear all lsb 1 bits.
+                code = (code | msz) & ((msz << 1) - 1);
+            }
+            ht.codeword[ht.codeword.len - 1].code = code;
+            // populate lookup tables
+            var i = ht.codeword.len;
+            while (i > 0) {
+                i -= 1;
+                const codeword = ht.codeword[i];
+                if (codeword.len == 0) {
+                    continue;
+                } else if (codeword.len <= lookup_size) {
+                    const stride = @as(Code, 1) << codeword.len;
+                    var lookup_idx = codeword.code;
+                    while (lookup_idx < ht.lookup.len) : (lookup_idx += stride)
+                        ht.lookup[lookup_idx] = .{ .payload = .{ .symbol = codeword.symbol }, .len = codeword.len };
+                } else {
+                    const prefix = codeword.code & ((@as(Code, 1) << lookup_size) - 1);
+                    const tmp = ht.lookup[prefix].payload.next;
+                    ht.lookup[prefix].payload.next = @enumFromInt(i);
+                    ht.codeword[i].next = tmp;
                 }
             }
         }
 
-        fn query(h: *@This()) Symbol {
-            const prefix = h.bitbuffer & ((1 << lookup_size) - 1);
-            const entry = h.lookup[prefix];
-            if (entry.len > 0) {
-                h.bitbuffer >>= entry.len; // consume code
-                return entry.payload.symbol;
-            }
-            var next: Index = entry.payload.next;
-            var codeword: Codeword = undefined;
-            while (next != .nil) : (next = codeword.next) {
-                codeword = h.symbol[@intFromEnum(next)];
-                const mask = (@as(Symbol, 1) << codeword.len) - 1;
-                if ((h.bitbuffer & mask) == codeword.code) {
-                    h.bitbuffer >>= codeword.len; // consume code
+        fn query(ht: *@This()) Symbol {
+            const mask = (1 << lookup_size) - 1;
+            const entry = ht.lookup[ht.bitbuffer & mask];
+            if (entry.len == 0) {
+                var next: CodewordIndex = entry.payload.next;
+                while (next != .nil) {
+                    const codeword = ht.codeword[@intFromEnum(next)];
+                    next = codeword.next;
+                    const code = ht.bitbuffer & ((@as(Code, 1) << codeword.len) - 1);
+                    if (code != codeword.code) continue;
+                    ht.bitbuffer >>= codeword.len;
                     return codeword.symbol;
                 }
+                unreachable;
             }
-            // hitting nil should just lead to a buffer overflow and therefore unreachable
-            unreachable;
+            ht.bitbuffer >>= entry.len;
+            return entry.payload.symbol;
         }
     };
-}
-
-fn incr_left_lsb(bits: u5, j: u32) u32 {
-    // find first zero position
-    const inverse = ~j & ((@as(u32, 1) << bits) - 1);
-    const pos: u5 = @intCast(32 - 1 - @clz(inverse));
-    // set first zero to 1, set all values left of that to 0
-    const mask = (@as(u32, 1) << pos) - 1;
-    return (j & mask) | (@as(u32, 1) << pos);
-}
-
-test incr_left_lsb {
-    try std.testing.expectEqual(0b111, incr_left_lsb(3, 0b011));
-    try std.testing.expectEqual(0b0111, incr_left_lsb(4, 0b1011));
-    try std.testing.expectEqual(0b1001, incr_left_lsb(4, 0b0001));
 }
 
 const std = @import("std");
@@ -123,7 +106,7 @@ test Htree {
     // alphabet: A, B, C, D, E, F, G
     const codelengths = [_]u4{ 3, 3, 3, 3, 3, 2, 4, 4 };
     var decoder: Htree = .{};
-    decoder.build(codelengths);
+    decoder.build(&codelengths);
     // symbol table tests
     // the codes are in fact reversed
     try std.testing.expectEqualSlices(Htree.Codeword, &.{
@@ -135,7 +118,7 @@ test Htree {
         .{ .len = 3, .code = 3, .symbol = 4, .next = .nil }, // 110 -> 011
         .{ .len = 4, .code = 7, .symbol = 6, .next = @enumFromInt(7) }, // 1110 -> 0111
         .{ .len = 4, .code = 15, .symbol = 7, .next = .nil }, // 1111 -> 1111
-    }, &decoder.symbol);
+    }, &decoder.codeword);
 
     try std.testing.expectEqualSlices(Htree.Entry, &.{
         .{ .len = 2, .payload = .{ .symbol = 5 } },
@@ -154,5 +137,6 @@ test Htree {
     try std.testing.expectEqual(0, decoder.query());
     try std.testing.expectEqual(0b0111, decoder.bitbuffer);
     try std.testing.expectEqual(6, decoder.query());
+
     try std.testing.expect(1 == 0);
 }
