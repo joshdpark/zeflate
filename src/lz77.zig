@@ -22,11 +22,7 @@
 // certain length, determined by a run-time parameter.
 
 const std = @import("std");
-const mem = std.mem;
-const expect = std.testing.expect;
-const ArrayList = std.ArrayList;
-const formatInt = std.fmt.formatInt;
-// const window = std.mem.window;
+const assert = std.debug.assert;
 
 // key: XYZ bytes, value: linked list of absolute positions for where match was
 // if there is a collision, then don't overwrite but prepend new value as a node
@@ -39,156 +35,100 @@ const formatInt = std.fmt.formatInt;
 //    while everything behind it to the beginning of the buffer will be the
 //    search buffer
 
-const Pointer = struct {
-    // 1 << 12 is the total size of 4kb
-    offset: usize,
-    len: u12,
-};
+fn scanner(size: u32) type {
+    assert(size & (size - 1) == 0);
+    return struct {
+        const Idx = enum(u16) {
+            nil = std.math.maxInt(u16),
+            _,
+        };
 
-/// this is an attempt at a first implementation of trying to make multiple
-/// matches for a sequence of 3 bytes in a search buffer
-const Window = struct {
-    buf: []const u8,
-    seq: *const [3]u8,
+        const Hash_i = Idx;
+        const Chain_i = Idx;
 
-    const Iterator = struct {
-        window: *const Window,
-        pos: usize, // offset into search buffer
+        const Token = union(enum) { char: u8, pair: struct {
+            dist: usize,
+            mlen: usize,
+        } };
 
-        /// get the next match of sequence
-        fn next(self: *@This()) ?usize {
-            const buf = self.window.buf;
-            const seq = self.window.seq[0..];
-            // std.debug.print("state: buf: {s}, seq: {s}\n", .{ buf, seq });
-            while (self.pos <= buf.len - 3) : (self.pos += 1) {
-                // compare the sequence of 3 bytes against the search buffer
-                // std.debug.print("pos: {d}, limit: {d}, buf: {s}, seq: {s}\n", .{ self.pos, buf.len - 3, buf[self.pos..][0..3], seq });
-                if (std.mem.eql(u8, buf[self.pos..][0..3], seq)) {
-                    const tmp = self.pos;
-                    self.pos += 1;
-                    return tmp;
+        input: []const u8,
+        hash_table: [size]Chain_i,
+        chain_table: [size]Chain_i,
+
+        pub fn init(input: []const u8) @This() {
+            return .{
+                .input = input,
+                .hash_table = @splat(.nil),
+                .chain_table = @splat(.nil),
+            };
+        }
+
+        fn hash(three: [3]u8) Hash_i {
+            const h: u16 = @truncate(@as(u24, @bitCast(three)) % 1009);
+            return @enumFromInt(h);
+        }
+
+        fn matchLength(cursor: []u8, back: []u8) u32 {
+            const n = @min(cursor.len, back.len);
+            for (cursor[0..][0..n], back[0..][0..n], 0..) |a, b, len|
+                if (a != b) return len;
+        }
+
+        /// otherwise emit (dist,len) is match
+        pub fn scan(self: *@This()) void {
+            const N = self.input.len;
+            for (0..N - 2) |i| {
+                const string: [3]u8 = self.input[i..][0..3].*;
+                const h = hash(string);
+                // look for a previous match by taking the hash and
+                // indexing into the hash_table,
+                var prev: *Chain_i = &self.hash_table[@intFromEnum(h)];
+                if (prev.* == .nil) {
+                    prev.* = @enumFromInt(i);
+                    emit(.{ .char = string[0] });
+                } else {
+                    // update chain table to point to last occurance of string
+                    const tmp = prev.*;
+                    prev.* = @enumFromInt(i);
+                    self.chain_table[@intFromEnum(prev.*)] = tmp;
+                    // iterate through the chain table linked list
+                    // to find the longest string match
+                    var mlen: usize = 0;
+                    var dist: usize = @intFromEnum(prev.*);
+                    // chain loop
+                    while (prev.* != .nil) {
+                        const a = self.input[@intFromEnum(prev.*)..];
+                        const b = self.input[i..];
+                        const len = @min(a.len, b.len);
+                        // mlen loop
+                        var test_mlen: usize = undefined;
+                        for (a[0..len], b[0..len], 0..) |back, here, l| {
+                            if (back != here) {
+                                test_mlen = l;
+                                break;
+                            }
+                        }
+                        if (test_mlen > mlen) {
+                            mlen = test_mlen;
+                            dist = i;
+                        }
+                        // doing a full search down the chain
+                        prev = &self.chain_table[@intFromEnum(prev.*)];
+                    }
+                    emit(.{ .pair = .{ .dist = dist, .mlen = mlen } });
                 }
             }
-            return null;
+        }
+
+        fn emit(token: Token) void {
+            _ = token;
         }
     };
-
-    fn iter(self: *const @This()) Iterator {
-        return .{
-            .window = self,
-            .pos = 0,
-        };
-    }
-};
-
-test Window {
-    const w = Window{
-        .buf = "aabbccddbbceeff",
-        .seq = "bbc",
-    };
-    var it = w.iter();
-    try expect(it.next().? == 2);
-    try expect(it.next().? == 8);
-    // while (it.next()) |n| {
-    //     std.debug.print("pos: {d}\n", .{n});
-    // } else {
-    //     std.debug.print("pos: null\n", .{});
-    // }
 }
 
-/// NOTE: this is an linear search, since for each char in the search buffer,
-/// it's comparing to the front of the lookahead buffer.
-fn match(buf: []const u8, cursor: usize) ?Pointer {
-    const search: []const u8 = buf[0..cursor];
-    const lookahead: []const u8 = buf[cursor..];
-    const window = Window{
-        .buf = search,
-        .seq = lookahead[0..3],
-    };
-    // std.debug.print("window: {s}, {s}\n", .{ window.buf, window.seq });
-    // here is where we will store the offset and length of a matching sequence
-    // with the following priorities:
-    // 1. the longest length is used
-    // 2. the offset closet to the cursor (min(cursor - offset))
-    var offset: ?usize = null;
-    var len: ?u12 = null;
-    var it = window.iter();
-    while (it.next()) |match_offset| {
-        const matchbuf = buf[match_offset..];
-        // std.debug.print("matchbuf: {s}\n", .{matchbuf});
-        var l: u12 = 0;
-        while (l < lookahead.len and lookahead[l] == matchbuf[l]) {
-            l += 1;
-        }
-        //compare lengths
-        if (l < len orelse 0) {
-            continue;
-        }
-        len = l;
-        offset = cursor - match_offset;
-        // std.debug.print("offset: {d}, len: {d}\n", .{ offset orelse 0, len orelse 0 });
-    }
-    // TODO: I'm pretty sure I could use simd vectorization here to do an xor
-    // comparison if there is a match, therefore removing branching.
-    if (offset) |_| {
-        return Pointer{ .offset = offset.?, .len = len.? };
-    } else {
-        return null;
-    }
+test scanner {
+    const Scanner = scanner(1 << 16);
+    const string = "aaabbbabba";
+    var lz = Scanner.init(string);
+    lz.scan();
 }
-
-test match {
-    try expect(std.meta.eql(match("aabbbcbbb", 6).?, Pointer{ .offset = 4, .len = 3 }));
-    try expect(match("aabbccdd", 4) == null);
-    // match should also extend past the search buffer into the lookahead
-    try expect(std.meta.eql(match("aabbaabbaabb", 4).?, Pointer{ .offset = 4, .len = 8 }));
-    // match should get the offset closest to the cursor
-    std.debug.print("{any}\n", .{match("aaabbbaaaaaaccc", 9).?});
-    try expect(std.meta.eql(match("aaabbbaaaaaaccc", 9).?, Pointer{ .offset = 3, .len = 3 }));
-}
-
-fn naive_lz77(input: []const u8, list: anytype) !void {
-    // no need to start cursor at the beginning since we're matching on a sliding window of 3 bytes
-    var cursor: usize = 3;
-    _ = try list.writeAll(input[0..cursor]);
-    // var matchlen: u12 = 0;
-    while (cursor < input.len) {
-        if (match(input, cursor)) |ptr| {
-            // matchlen += 1;
-            _ = try list.writeByte('<');
-            try formatInt(ptr.offset, 10, .lower, .{}, list);
-            _ = try list.writeByte(',');
-            try formatInt(ptr.len, 10, .lower, .{}, list);
-            _ = try list.writeByte('>');
-            cursor += ptr.len;
-        } else {
-            _ = try list.writeByte(input[cursor]);
-            cursor += 1;
-        }
-    }
-    // try list.flush();
-}
-
-test naive_lz77 {
-    const str = "hello world hello world hello world foobar bar foo";
-    var list = std.ArrayList(u8).init(std.testing.allocator);
-    defer list.deinit();
-    try naive_lz77(str, list.writer());
-    std.debug.print("{s}\n", .{list.items});
-}
-
-// TODO: implement a hashtable
-fn hash() u8 {}
-fn ChainedHash() type {}
-// psuedocode
-// while (window.next()) |xyz| {
-// 	if xyz in hashchain,
-// 		for each entry in chain
-// 			compare the length of the match at current position
-// 			select the longest match
-// 	else
-// 		add xyz to hashchain with position
-// 		write x as a literal byte
-// }
-
-pub fn main() void {}
