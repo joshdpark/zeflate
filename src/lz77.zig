@@ -82,7 +82,7 @@ fn scanner(sz: usize) type {
             // the key insight here is that any values in the chain table
             // must be greater than j -% sz which indicates the window area
             var match: Token = .{ .pair = .{ .dist = 0, .len = 0 } };
-            while (next > i -| sz) {
+            while (next >= i -| sz) {
                 j = next;
                 // cmp cursor[i..], cursor[j..] for matchlen
                 const mlen = self.matchlen(i, @as(usize, @intCast(j)));
@@ -91,13 +91,25 @@ fn scanner(sz: usize) type {
                 // follow the list
                 next = self.chain[@as(usize, @intCast(j)) & chain_mask];
             }
-            return match;
+            // a bug because collision might cause us to get a match with a len=0
+            // TODO: make this an optional
+            return if (match.pair.len > 0) match else .{ .literal = substring[0] };
         }
 
         fn scan(self: *@This()) void {
-            for (0..self.string.len - 2) |i| {
-                emit(self.search(i));
+            var i: usize = 0;
+            const bound = self.string.len - 2;
+            while (i < bound) {
+                const token = self.search(i);
+                emit(token);
+                switch (token) {
+                    .literal => i += 1,
+                    .pair => |p| i += p.len,
+                }
             }
+            // take care of the last few chars if any
+            while (i < self.string.len) : (i += 1)
+                emit(.{ .literal = self.string[i] });
         }
 
         fn emit(token: Token) void {
@@ -111,7 +123,7 @@ fn scanner(sz: usize) type {
 
 test scanner {
     const Scanner = scanner(1 << 16);
-    const string = "aaabbbabba";
+    const string = "Peter Piper picked a peck of pickled peppers, a peck of pickled peppers Peter Piper picked. If Peter Piper picked a peck of pickled peppers, where's the peck of pickled peppers Peter Piper picked?";
     var lz = Scanner.init(string);
     lz.scan();
 }
