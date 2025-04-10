@@ -35,93 +35,76 @@ const assert = std.debug.assert;
 //    while everything behind it to the beginning of the buffer will be the
 //    search buffer
 
-fn scanner(size: u32) type {
-    assert(size & (size - 1) == 0);
+fn scanner(sz: usize) type {
+    assert(std.math.isPowerOfTwo(sz));
     return struct {
-        const Idx = enum(u16) {
-            nil = std.math.maxInt(u16),
-            _,
-        };
+        string: []const u8,
+        hashtable: [sz]?i32,
+        chain: [sz]i32, // needed for the negative values
 
-        const Hash_i = Idx;
-        const Chain_i = Idx;
+        const chain_mask = sz - 1;
 
-        const Token = union(enum) { char: u8, pair: struct {
+        const Token = union(enum) { literal: u8, pair: struct {
             dist: usize,
-            mlen: usize,
+            len: usize,
         } };
 
-        input: []const u8,
-        hash_table: [size]Chain_i,
-        chain_table: [size]Chain_i,
-
-        pub fn init(input: []const u8) @This() {
+        fn init(string: []const u8) @This() {
             return .{
-                .input = input,
-                .hash_table = @splat(.nil),
-                .chain_table = @splat(.nil),
+                .string = string,
+                .hashtable = @splat(null),
+                .chain = @splat(-1),
             };
         }
 
-        fn hash(three: [3]u8) Hash_i {
-            const h: u16 = @truncate(@as(u24, @bitCast(three)) % 1009);
-            return @enumFromInt(h);
+        fn hash(substring: [3]u8) u16 {
+            return @truncate(@as(u24, @bitCast(substring)) % 1009);
         }
 
-        fn matchLength(cursor: []u8, back: []u8) u32 {
-            const n = @min(cursor.len, back.len);
-            for (cursor[0..][0..n], back[0..][0..n], 0..) |a, b, len|
-                if (a != b) return len;
+        fn matchlen(self: *@This(), i: usize, j: usize) usize {
+            const bound = @min(self.string.len - i, self.string.len - j);
+            for (self.string[i..][0..bound], self.string[j..][0..bound], 0..) |*a, *b, l| {
+                if (a.* != b.*) return l;
+            }
+            return bound;
         }
 
-        /// otherwise emit (dist,len) is match
-        pub fn scan(self: *@This()) void {
-            const N = self.input.len;
-            for (0..N - 2) |i| {
-                const string: [3]u8 = self.input[i..][0..3].*;
-                const h = hash(string);
-                // look for a previous match by taking the hash and
-                // indexing into the hash_table,
-                var prev: *Chain_i = &self.hash_table[@intFromEnum(h)];
-                if (prev.* == .nil) {
-                    prev.* = @enumFromInt(i);
-                    emit(.{ .char = string[0] });
-                } else {
-                    // update chain table to point to last occurance of string
-                    const tmp = prev.*;
-                    prev.* = @enumFromInt(i);
-                    self.chain_table[@intFromEnum(prev.*)] = tmp;
-                    // iterate through the chain table linked list
-                    // to find the longest string match
-                    var mlen: usize = 0;
-                    var dist: usize = @intFromEnum(prev.*);
-                    // chain loop
-                    while (prev.* != .nil) {
-                        const a = self.input[@intFromEnum(prev.*)..];
-                        const b = self.input[i..];
-                        const len = @min(a.len, b.len);
-                        // mlen loop
-                        var test_mlen: usize = undefined;
-                        for (a[0..len], b[0..len], 0..) |back, here, l| {
-                            if (back != here) {
-                                test_mlen = l;
-                                break;
-                            }
-                        }
-                        if (test_mlen > mlen) {
-                            mlen = test_mlen;
-                            dist = i;
-                        }
-                        // doing a full search down the chain
-                        prev = &self.chain_table[@intFromEnum(prev.*)];
-                    }
-                    emit(.{ .pair = .{ .dist = dist, .mlen = mlen } });
-                }
+        fn search(self: *@This(), i: usize) Token {
+            const substring: [3]u8 = self.string[i..][0..3].*;
+            const h = hash(substring);
+            var j: i32 = @intCast(i);
+            // if next is empty, then update hashtable
+            var next: i32 = self.hashtable[h] orelse {
+                self.hashtable[h] = @intCast(i);
+                return .{ .literal = substring[0] };
+            };
+            self.chain[@as(usize, @intCast(j)) & chain_mask] = next;
+            // the key insight here is that any values in the chain table
+            // must be greater than j -% sz which indicates the window area
+            var match: Token = .{ .pair = .{ .dist = 0, .len = 0 } };
+            while (next > i -| sz) {
+                j = next;
+                // cmp cursor[i..], cursor[j..] for matchlen
+                const mlen = self.matchlen(i, @as(usize, @intCast(j)));
+                if (mlen > match.pair.len)
+                    match = .{ .pair = .{ .dist = i - @as(usize, @intCast(j)), .len = mlen } };
+                // follow the list
+                next = self.chain[@as(usize, @intCast(j)) & chain_mask];
+            }
+            return match;
+        }
+
+        fn scan(self: *@This()) void {
+            for (0..self.string.len - 2) |i| {
+                emit(self.search(i));
             }
         }
 
         fn emit(token: Token) void {
-            _ = token;
+            switch (token) {
+                .literal => |lit| std.debug.print("{c}", .{lit}),
+                .pair => |p| std.debug.print("({d},{d})", .{ p.dist, p.len }),
+            }
         }
     };
 }
