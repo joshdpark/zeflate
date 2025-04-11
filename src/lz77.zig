@@ -40,14 +40,14 @@ fn lz_compressor(window_size: usize) type {
     assert(std.math.isPowerOfTwo(window_size));
     return struct {
         string: []const u8,
-        hashtable: [window_size]i32,
-        chain: [window_size]i32,
+        hashtable: [window_size]i16,
+        chain: [window_size]i16,
 
-        const chain_mask = window_size - 1;
+        const chain_mask = std.math.maxInt(u15);
 
         const Pair = struct {
-            dist: i32 = 0,
-            len: u32 = 0,
+            dist: u15 = 0, // a dist can never be more than 32k away
+            len: u8 = 0, // a length must be in the range of 3..258
         };
 
         const Token = union(enum) {
@@ -70,17 +70,16 @@ fn lz_compressor(window_size: usize) type {
         /// i: compressor head
         /// j: backreference
         /// returns a matchlen
-        fn matchlen(self: *@This(), i: usize, j: usize) u32 {
+        fn matchlen(self: *@This(), i: usize, j: usize) i16 {
             assert(i > j);
             const string = self.string;
             // invariant: we cannot exceed the bounds of string[i..]
-            const bound: u32 = @intCast(string[i..].len);
-            var len: u32 = 0;
+            const bound: u16 = @min(258, @as(u16, @intCast(string[i..].len)));
+            var len: i16 = -3;
             for (string[j..][0..bound], string[i..][0..bound]) |ref, head| {
                 if (ref != head) break;
                 len += 1;
             }
-            assert(len <= window_size);
             return len;
         }
 
@@ -89,8 +88,8 @@ fn lz_compressor(window_size: usize) type {
             // the hashtable contains the head of the back reference linked list
             // update the list to the current location
             const h = hash(@bitCast(self.string[i..][0..4].*));
-            var next: i32 = self.hashtable[h];
-            self.hashtable[h] = @as(i32, @intCast(i));
+            var next: i16 = self.hashtable[h];
+            self.hashtable[h] = @intCast(i);
 
             // no match, return a literal
             if (next < 0) return .{ .literal = self.string[i] };
@@ -106,7 +105,7 @@ fn lz_compressor(window_size: usize) type {
                 assert(next < i);
                 const n: usize = @intCast(next);
                 const mlen = self.matchlen(i, n);
-                if (mlen > match.len) match = .{ .dist = @intCast(i - n), .len = mlen };
+                if (mlen > match.len) match = .{ .dist = @intCast(i - n), .len = @intCast(mlen) };
                 next = self.hashtable[n & chain_mask];
             }
             return if (match.len > 0) .{ .pair = match } else .{ .literal = self.string[i] };
@@ -129,7 +128,7 @@ fn lz_compressor(window_size: usize) type {
             list.append(alloc, token) catch unreachable;
             return switch (token) {
                 .literal => 1,
-                .pair => |p| p.len,
+                .pair => |p| p.len + 3,
             };
         }
     };
@@ -149,7 +148,7 @@ test lz_compressor {
     for (list.items) |item| {
         switch (item) {
             .literal => |l| std.debug.print("{c}", .{l}),
-            .pair => |p| std.debug.print("({d},{d})", .{ p.dist, p.len }),
+            .pair => |p| std.debug.print("({d},{d})", .{ p.dist, p.len + 3 }),
         }
     }
 }
