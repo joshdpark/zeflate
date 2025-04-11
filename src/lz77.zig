@@ -35,95 +35,121 @@ const assert = std.debug.assert;
 //    while everything behind it to the beginning of the buffer will be the
 //    search buffer
 
-fn scanner(sz: usize) type {
-    assert(std.math.isPowerOfTwo(sz));
+fn lz_compressor(window_size: usize) type {
+    // linked list for hash table should have 2^n entries
+    assert(std.math.isPowerOfTwo(window_size));
     return struct {
         string: []const u8,
-        hashtable: [sz]?i32,
-        chain: [sz]i32, // needed for the negative values
+        hashtable: [window_size]i32,
+        chain: [window_size]i32,
 
-        const chain_mask = sz - 1;
+        const chain_mask = window_size - 1;
 
-        const Token = union(enum) { literal: u8, pair: struct {
-            dist: usize,
-            len: usize,
-        } };
+        const Pair = struct {
+            dist: i32 = 0,
+            len: u32 = 0,
+        };
+
+        const Token = union(enum) {
+            literal: u8,
+            pair: Pair,
+        };
 
         fn init(string: []const u8) @This() {
             return .{
                 .string = string,
-                .hashtable = @splat(null),
+                .hashtable = @splat(-1),
                 .chain = @splat(-1),
             };
         }
 
-        fn hash(substring: [3]u8) u16 {
-            return @truncate(@as(u24, @bitCast(substring)) % 1009);
+        fn hash(substring: u32) u32 {
+            return substring % 1009;
         }
 
-        fn matchlen(self: *@This(), i: usize, j: usize) usize {
-            const bound = @min(self.string.len - i, self.string.len - j);
-            for (self.string[i..][0..bound], self.string[j..][0..bound], 0..) |*a, *b, l| {
-                if (a.* != b.*) return l;
+        /// i: compressor head
+        /// j: backreference
+        /// returns a matchlen
+        fn matchlen(self: *@This(), i: usize, j: usize) u32 {
+            assert(i > j);
+            const string = self.string;
+            // invariant: we cannot exceed the bounds of string[i..]
+            const bound: u32 = @intCast(string[i..].len);
+            var len: u32 = 0;
+            for (string[j..][0..bound], string[i..][0..bound]) |ref, head| {
+                if (ref != head) break;
+                len += 1;
             }
-            return bound;
+            assert(len <= window_size);
+            return len;
         }
 
+        // i: compressor head
         fn search(self: *@This(), i: usize) Token {
-            const substring: [3]u8 = self.string[i..][0..3].*;
-            const h = hash(substring);
-            var j: i32 = @intCast(i);
-            // if next is empty, then update hashtable
-            var next: i32 = self.hashtable[h] orelse {
-                self.hashtable[h] = @intCast(i);
-                return .{ .literal = substring[0] };
-            };
-            self.chain[@as(usize, @intCast(j)) & chain_mask] = next;
-            // the key insight here is that any values in the chain table
-            // must be greater than j -% sz which indicates the window area
-            var match: Token = .{ .pair = .{ .dist = 0, .len = 0 } };
-            while (next >= i -| sz) {
-                j = next;
-                // cmp cursor[i..], cursor[j..] for matchlen
-                const mlen = self.matchlen(i, @as(usize, @intCast(j)));
-                if (mlen > match.pair.len)
-                    match = .{ .pair = .{ .dist = i - @as(usize, @intCast(j)), .len = mlen } };
-                // follow the list
-                next = self.chain[@as(usize, @intCast(j)) & chain_mask];
+            // the hashtable contains the head of the back reference linked list
+            // update the list to the current location
+            const h = hash(@bitCast(self.string[i..][0..4].*));
+            var next: i32 = self.hashtable[h];
+            self.hashtable[h] = @as(i32, @intCast(i));
+
+            // no match, return a literal
+            if (next < 0) return .{ .literal = self.string[i] };
+
+            // update the linked list head
+            self.chain[i & chain_mask] = next;
+
+            var match: Pair = .{};
+            // invariant: terminate on any next pointers that exceed the window
+            // size boundary
+            // next: [i -| window_size, i)
+            while (next >= i -| window_size) {
+                assert(next < i);
+                const n: usize = @intCast(next);
+                const mlen = self.matchlen(i, n);
+                if (mlen > match.len) match = .{ .dist = @intCast(i - n), .len = mlen };
+                next = self.hashtable[n & chain_mask];
             }
-            // a bug because collision might cause us to get a match with a len=0
-            // TODO: make this an optional
-            return if (match.pair.len > 0) match else .{ .literal = substring[0] };
+            return if (match.len > 0) .{ .pair = match } else .{ .literal = self.string[i] };
         }
 
-        fn scan(self: *@This()) void {
+        fn compress(self: *@This(), alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(Token)) void {
+            // i: [0, stringlen - 4); to prevent overflow of hashing substring
             var i: usize = 0;
-            const bound = self.string.len - 2;
-            while (i < bound) {
-                const token = self.search(i);
-                emit(token);
-                switch (token) {
-                    .literal => i += 1,
-                    .pair => |p| i += p.len,
-                }
+            while (i < self.string.len - 4) {
+                i += emit(alloc, list, self.search(i));
             }
-            // take care of the last few chars if any
-            while (i < self.string.len) : (i += 1)
-                emit(.{ .literal = self.string[i] });
+            // i: [stringlen - 4, stringlen)
+            assert(i > self.string.len - 4);
+            while (i < self.string.len) {
+                i += emit(alloc, list, .{ .literal = self.string[i] });
+            }
         }
 
-        fn emit(token: Token) void {
-            switch (token) {
-                .literal => |lit| std.debug.print("{c}", .{lit}),
-                .pair => |p| std.debug.print("({d},{d})", .{ p.dist, p.len }),
-            }
+        fn emit(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(Token), token: Token) usize {
+            list.append(alloc, token) catch unreachable;
+            return switch (token) {
+                .literal => 1,
+                .pair => |p| p.len,
+            };
         }
     };
 }
 
-test scanner {
-    const Scanner = scanner(1 << 16);
+test lz_compressor {
+    const compressor = lz_compressor(1 << 15);
     const string = "Peter Piper picked a peck of pickled peppers, a peck of pickled peppers Peter Piper picked. If Peter Piper picked a peck of pickled peppers, where's the peck of pickled peppers Peter Piper picked?";
-    var lz = Scanner.init(string);
-    lz.scan();
+    var lz = compressor.init(string);
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    var list: std.ArrayListUnmanaged(compressor.Token) = .empty;
+    defer list.deinit(gpa.allocator());
+    lz.compress(gpa.allocator(), &list);
+
+    // debug print out how it looks
+    for (list.items) |item| {
+        switch (item) {
+            .literal => |l| std.debug.print("{c}", .{l}),
+            .pair => |p| std.debug.print("({d},{d})", .{ p.dist, p.len }),
+        }
+    }
 }
