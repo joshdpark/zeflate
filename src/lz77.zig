@@ -35,120 +35,133 @@ const assert = std.debug.assert;
 //    while everything behind it to the beginning of the buffer will be the
 //    search buffer
 
-fn lz_compressor(window_size: usize) type {
-    // linked list for hash table should have 2^n entries
-    assert(std.math.isPowerOfTwo(window_size));
-    return struct {
-        string: []const u8,
-        hashtable: [window_size]i16,
-        chain: [window_size]i16,
+const lz_compressor = struct {
+    string: []const u8,
+    hashtable: [window_size]i16,
+    chain: [window_size]i16,
 
-        const chain_mask = std.math.maxInt(u15);
+    const window_size = 1 << 15;
+    const chain_mask = std.math.maxInt(u15);
 
-        const Pair = struct {
-            dist: u15 = 0, // a dist can never be more than 32k away
-            len: u8 = 0, // a length must be in the range of 3..258
-        };
-
-        const Token = union(enum) {
-            literal: u8,
-            pair: Pair,
-        };
-
-        fn init(string: []const u8) @This() {
-            return .{
-                .string = string,
-                .hashtable = @splat(-1),
-                .chain = @splat(-1),
-            };
-        }
-
-        fn hash(substring: u32) u32 {
-            return substring % 1009;
-        }
-
-        /// i: compressor head
-        /// j: backreference
-        /// returns a matchlen
-        fn matchlen(self: *@This(), i: usize, j: usize) i16 {
-            assert(i > j);
-            const string = self.string;
-            // invariant: we cannot exceed the bounds of string[i..]
-            const bound: u16 = @min(258, @as(u16, @intCast(string[i..].len)));
-            var len: i16 = -3;
-            for (string[j..][0..bound], string[i..][0..bound]) |ref, head| {
-                if (ref != head) break;
-                len += 1;
-            }
-            return len;
-        }
-
-        // i: compressor head
-        fn search(self: *@This(), i: usize) Token {
-            // the hashtable contains the head of the back reference linked list
-            // update the list to the current location
-            const h = hash(@bitCast(self.string[i..][0..4].*));
-            var next: i16 = self.hashtable[h];
-            self.hashtable[h] = @intCast(i);
-
-            // no match, return a literal
-            if (next < 0) return .{ .literal = self.string[i] };
-
-            // update the linked list head
-            self.chain[i & chain_mask] = next;
-
-            var match: Pair = .{};
-            // invariant: terminate on any next pointers that exceed the window
-            // size boundary
-            // next: [i -| window_size, i)
-            while (next >= i -| window_size) {
-                assert(next < i);
-                const n: usize = @intCast(next);
-                const mlen = self.matchlen(i, n);
-                if (mlen > match.len) match = .{ .dist = @intCast(i - n), .len = @intCast(mlen) };
-                next = self.hashtable[n & chain_mask];
-            }
-            return if (match.len > 0) .{ .pair = match } else .{ .literal = self.string[i] };
-        }
-
-        fn compress(self: *@This(), alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(Token)) void {
-            // i: [0, stringlen - 4); to prevent overflow of hashing substring
-            var i: usize = 0;
-            while (i < self.string.len - 4) {
-                i += emit(alloc, list, self.search(i));
-            }
-            // i: [stringlen - 4, stringlen)
-            assert(i > self.string.len - 4);
-            while (i < self.string.len) {
-                i += emit(alloc, list, .{ .literal = self.string[i] });
-            }
-        }
-
-        fn emit(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(Token), token: Token) usize {
-            list.append(alloc, token) catch unreachable;
-            return switch (token) {
-                .literal => 1,
-                .pair => |p| p.len + 3,
-            };
-        }
+    const Pair = struct {
+        dist: u15 = 0, // a dist can never be more than 32k away
+        len: u8 = 0, // a length must be in the range of 3..258
     };
-}
+
+    const Token = union(enum) {
+        literal: u8,
+        pair: Pair,
+    };
+
+    fn init(string: []const u8) @This() {
+        return .{
+            .string = string,
+            .hashtable = @splat(std.math.minInt(i16)),
+            .chain = @splat(std.math.minInt(i16)),
+        };
+    }
+
+    fn hash(substring: u32) u15 {
+        return @intCast(substring % 1009);
+    }
+
+    /// i: compressor head
+    /// j: backreference
+    /// returns a matchlen
+    fn matchlen(self: *@This(), i: usize, j: usize) i16 {
+        assert(i > j);
+        const string = self.string;
+        // invariant: we cannot exceed the bounds of string[i..]
+        const bound: u16 = @min(258, @as(u16, @intCast(string[i..].len)));
+        var len: i16 = -3;
+        for (string[j..][0..bound], string[i..][0..bound]) |ref, head| {
+            if (ref != head) break;
+            len += 1;
+        }
+        return len;
+    }
+
+    /// when calculating the distance between two points in the chain table, one
+    /// issue that comes up is since this is a circular buffer, a next pointer
+    /// might point to an index > the current index.
+    fn distance(cur: i16, back: i16) usize {
+        // return (chain_mask + a - b) & chain_mask;
+        const result = if (cur > back) cur - back else chain_mask - back + cur;
+        return @intCast(result);
+    }
+
+    // i: compressor head
+    fn search(self: *@This(), i: usize) Token {
+        // the hashtable contains the head of the back reference linked list
+        // update the list to the current location
+        const h = hash(@bitCast(self.string[i..][0..4].*));
+        var next: i16 = self.hashtable[h];
+        const chain_i: i16 = @intCast(i & chain_mask);
+        self.hashtable[h] = chain_i;
+
+        // no match, return a literal
+        if (next < 0) return .{ .literal = self.string[i] };
+
+        // distance between chain_i going in a single direction
+        var diff: usize = distance(chain_i, next);
+
+        // update the linked list head
+        self.chain[@intCast(chain_i)] = next;
+
+        var match: Pair = .{};
+        // the search is limited by 2 invariants:
+        // 1. do no search past the window size
+        //    diff: [0, window_size); represents distance from i
+        // 2. terminate on nulls
+        //    next: must be in the range of [0, window_size)
+        while (true) {
+            const mlen = self.matchlen(i, i - diff);
+            if (mlen > match.len) match = .{ .dist = @intCast(diff), .len = @intCast(mlen) };
+            const head = next;
+            next = self.chain[@intCast(next)];
+            if (next < 0) break;
+            diff += distance(head, next);
+            if (diff > chain_mask) break;
+        }
+        return if (match.len > 0) .{ .pair = match } else .{ .literal = self.string[i] };
+    }
+
+    fn compress(self: *@This(), alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(Token)) void {
+        // i: [0, stringlen - 4); to prevent overflow of hashing substring
+        var i: usize = 0;
+        while (i < self.string.len - 4) {
+            i += emit(alloc, list, self.search(i));
+        }
+        // i: [stringlen - 4, stringlen)
+        assert(i > self.string.len - 4);
+        while (i < self.string.len) {
+            i += emit(alloc, list, .{ .literal = self.string[i] });
+        }
+    }
+
+    fn emit(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(Token), token: Token) usize {
+        list.append(alloc, token) catch unreachable;
+        return switch (token) {
+            .literal => 1,
+            .pair => |p| p.len + 3,
+        };
+    }
+};
 
 test lz_compressor {
-    const compressor = lz_compressor(1 << 15);
     const string = "Peter Piper picked a peck of pickled peppers, a peck of pickled peppers Peter Piper picked. If Peter Piper picked a peck of pickled peppers, where's the peck of pickled peppers Peter Piper picked?";
-    var lz = compressor.init(string);
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    var list: std.ArrayListUnmanaged(compressor.Token) = .empty;
-    defer list.deinit(gpa.allocator());
-    lz.compress(gpa.allocator(), &list);
+    var lz: lz_compressor = .init(string);
+    var dba: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = dba.deinit();
+    var list: std.ArrayListUnmanaged(lz_compressor.Token) = .empty;
+    defer list.deinit(dba.allocator());
+    lz.compress(dba.allocator(), &list);
 
     // debug print out how it looks
     for (list.items) |item| {
         switch (item) {
             .literal => |l| std.debug.print("{c}", .{l}),
-            .pair => |p| std.debug.print("({d},{d})", .{ p.dist, p.len + 3 }),
+            .pair => |p| std.debug.print("({d},{d})", .{ p.dist, p.len + 4 }),
         }
     }
 }
