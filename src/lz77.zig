@@ -37,11 +37,11 @@ const assert = std.debug.assert;
 
 const lz_compressor = struct {
     string: []const u8,
-    hashtable: [window_size]i16,
-    chain: [window_size]i16,
+    hashtable: [window_size]?u15,
+    chain: [window_size]u15,
 
     const window_size = 1 << 15;
-    const chain_mask = std.math.maxInt(u15);
+    const max_window = std.math.maxInt(u15);
 
     const Pair = struct {
         dist: u15 = 0, // a dist can never be more than 32k away
@@ -56,8 +56,8 @@ const lz_compressor = struct {
     fn init(string: []const u8) @This() {
         return .{
             .string = string,
-            .hashtable = @splat(std.math.minInt(i16)),
-            .chain = @splat(std.math.minInt(i16)),
+            .hashtable = @splat(null),
+            .chain = undefined,
         };
     }
 
@@ -68,7 +68,7 @@ const lz_compressor = struct {
     /// i: compressor head
     /// j: backreference
     /// returns a matchlen
-    fn matchlen(self: *@This(), i: usize, j: usize) i16 {
+    fn matchlen(self: *@This(), i: usize, j: usize) u8 {
         assert(i > j);
         const string = self.string;
         // invariant: we cannot exceed the bounds of string[i..]
@@ -78,15 +78,15 @@ const lz_compressor = struct {
             if (ref != head) break;
             len += 1;
         }
-        return len;
+        return if (len > 0) @intCast(len) else 0;
     }
 
     /// when calculating the distance between two points in the chain table, one
     /// issue that comes up is since this is a circular buffer, a next pointer
     /// might point to an index > the current index.
-    fn distance(cur: i16, back: i16) usize {
-        // return (chain_mask + a - b) & chain_mask;
-        const result = if (cur > back) cur - back else chain_mask - back + cur;
+    fn distance(cur: u15, next: u15) usize {
+        // return (max_window + a - b) & max_window;
+        const result = if (cur > next) cur - next else max_window - next + cur;
         return @intCast(result);
     }
 
@@ -95,35 +95,39 @@ const lz_compressor = struct {
         // the hashtable contains the head of the back reference linked list
         // update the list to the current location
         const h = hash(@bitCast(self.string[i..][0..4].*));
-        var next: i16 = self.hashtable[h];
-        const chain_i: i16 = @intCast(i & chain_mask);
-        self.hashtable[h] = chain_i;
+        // index into chain table
+        var k: u15 = @intCast(i & max_window);
+        // distance from i to back reference
+        var j: usize = 0;
 
-        // no match, return a literal
-        if (next < 0) return .{ .literal = self.string[i] };
+        // next chain pointer; if there is no next pointer then we update the
+        // hash table to point to k. This is so that the loop terminates
+        // correctly because if (chain[k] == k), then the distance will be
+        // outside the search window
+        var next: u15 = self.hashtable[h] orelse k;
+        // update the list head (stored in hashtable)
+        // and next (to point to previous head)
+        self.hashtable[h] = k;
+        self.chain[k] = next;
+        if (next == k) return .{ .literal = self.string[i] };
 
-        // distance between chain_i going in a single direction
-        var diff: usize = distance(chain_i, next);
-
-        // update the linked list head
-        self.chain[@intCast(chain_i)] = next;
-
-        var match: Pair = .{};
-        // the search is limited by 2 invariants:
-        // 1. do no search past the window size
-        //    diff: [0, window_size); represents distance from i
-        // 2. terminate on nulls
-        //    next: must be in the range of [0, window_size)
+        // the loop invariant is that it terminates if the next pointer would
+        // increase j (the distance from i) to or greater than the the window
+        // size. This invariant should hold for initial values because when
+        // chain[i] == i, then distance will be the window size
+        var pair: Pair = .{};
         while (true) {
-            const mlen = self.matchlen(i, i - diff);
-            if (mlen > match.len) match = .{ .dist = @intCast(diff), .len = @intCast(mlen) };
-            const head = next;
-            next = self.chain[@intCast(next)];
-            if (next < 0) break;
-            diff += distance(head, next);
-            if (diff > chain_mask) break;
+            j += distance(k, next);
+            if (j > max_window) break;
+
+            // update longest match if it exists
+            const mlen = self.matchlen(i, i - j);
+            if (mlen > pair.len) pair = .{ .dist = @intCast(j), .len = mlen };
+
+            k = next;
+            next = self.chain[next];
         }
-        return if (match.len > 0) .{ .pair = match } else .{ .literal = self.string[i] };
+        return if (pair.len > 4) .{ .pair = pair } else .{ .literal = self.string[i] };
     }
 
     fn compress(self: *@This(), alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(Token)) void {
@@ -132,8 +136,7 @@ const lz_compressor = struct {
         while (i < self.string.len - 4) {
             i += emit(alloc, list, self.search(i));
         }
-        // i: [stringlen - 4, stringlen)
-        assert(i > self.string.len - 4);
+        assert(i >= self.string.len - 5);
         while (i < self.string.len) {
             i += emit(alloc, list, .{ .literal = self.string[i] });
         }
@@ -149,7 +152,8 @@ const lz_compressor = struct {
 };
 
 test lz_compressor {
-    const string = "Peter Piper picked a peck of pickled peppers, a peck of pickled peppers Peter Piper picked. If Peter Piper picked a peck of pickled peppers, where's the peck of pickled peppers Peter Piper picked?";
+    // const string = "Peter Piper picked a peck of pickled peppers, a peck of pickled peppers Peter Piper picked. If Peter Piper picked a peck of pickled peppers, where's the peck of pickled peppers Peter Piper picked?";
+    const string = @embedFile("lz77.zig");
     var lz: lz_compressor = .init(string);
     var dba: std.heap.DebugAllocator(.{}) = .init;
     defer _ = dba.deinit();
@@ -157,11 +161,20 @@ test lz_compressor {
     defer list.deinit(dba.allocator());
     lz.compress(dba.allocator(), &list);
 
-    // debug print out how it looks
+    var output: [string.len]u8 = undefined;
+    var i: usize = 0;
     for (list.items) |item| {
         switch (item) {
-            .literal => |l| std.debug.print("{c}", .{l}),
-            .pair => |p| std.debug.print("({d},{d})", .{ p.dist, p.len + 4 }),
+            .literal => |l| {
+                output[i] = l;
+                i += 1;
+            },
+            .pair => |p| {
+                const bound = p.len + 3;
+                std.mem.copyForwards(u8, output[i..][0..bound], output[i - p.dist ..][0..bound]);
+                i += bound;
+            },
         }
     }
+    try std.testing.expectEqualStrings(string, &output);
 }
