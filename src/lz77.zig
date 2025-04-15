@@ -161,18 +161,23 @@ test lz_compressor {
 
     var output: [string.len]u8 = undefined;
     var i: usize = 0;
+    var literals: usize = 0;
+    var pairs: usize = 0;
     for (list.items) |item| {
         switch (item) {
             .literal => |l| {
                 output[i] = l;
                 i += 1;
+                literals += 1;
             },
             .pair => |p| {
                 const bound = @as(usize, @intCast(p.len)) + 3;
                 std.mem.copyForwards(u8, output[i..][0..bound], output[i - p.dist ..][0..bound]);
                 i += bound;
+                pairs += 1;
             },
         }
     }
+    std.debug.print("from {d} characters to {d} literals and {d} pairs", .{ string.len, literals, pairs });
     try std.testing.expectEqualStrings(string, &output);
 }
