@@ -72,7 +72,7 @@ const lz_compressor = struct {
         assert(i > j);
         const string = self.string;
         // invariant: we cannot exceed the bounds of string[i..]
-        const bound: u16 = @min(258, @as(u16, @intCast(string[i..].len)));
+        const bound: u16 = @intCast(@min(258, string[i..].len));
         var len: i16 = -3;
         for (string[j..][0..bound], string[i..][0..bound]) |ref, head| {
             if (ref != head) break;
@@ -92,8 +92,6 @@ const lz_compressor = struct {
 
     // i: compressor head
     fn search(self: *@This(), i: usize) Token {
-        // the hashtable contains the head of the back reference linked list
-        // update the list to the current location
         const h = hash(@bitCast(self.string[i..][0..4].*));
         // index into chain table
         var k: u15 = @intCast(i & max_window);
@@ -146,14 +144,14 @@ const lz_compressor = struct {
         list.append(alloc, token) catch unreachable;
         return switch (token) {
             .literal => 1,
-            .pair => |p| p.len + 3,
+            .pair => |p| @as(usize, @intCast(p.len)) + 3,
         };
     }
 };
 
 test lz_compressor {
     // const string = "Peter Piper picked a peck of pickled peppers, a peck of pickled peppers Peter Piper picked. If Peter Piper picked a peck of pickled peppers, where's the peck of pickled peppers Peter Piper picked?";
-    const string = @embedFile("lz77.zig");
+    const string = @embedFile("test/lz77test");
     var lz: lz_compressor = .init(string);
     var dba: std.heap.DebugAllocator(.{}) = .init;
     defer _ = dba.deinit();
@@ -170,7 +168,7 @@ test lz_compressor {
                 i += 1;
             },
             .pair => |p| {
-                const bound = p.len + 3;
+                const bound = @as(usize, @intCast(p.len)) + 3;
                 std.mem.copyForwards(u8, output[i..][0..bound], output[i - p.dist ..][0..bound]);
                 i += bound;
             },
