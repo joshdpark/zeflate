@@ -62,7 +62,8 @@ const lz_compressor = struct {
     }
 
     fn hash(substring: u32) u15 {
-        return @intCast(substring % 1009);
+        const fib: u64 = 11400714819323198486;
+        return @intCast((substring *% fib) >> (64 - 15));
     }
 
     /// i: compressor head
